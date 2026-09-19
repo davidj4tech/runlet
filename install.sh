@@ -19,15 +19,23 @@
 # applies the schema, registers a workers.dev subdomain if the account has
 # none, generates the HMAC key and the URL secret, sets both as Worker
 # secrets, deploys the Worker, writes ~/.config/runlet/{env,relay.key},
-# and starts the runner as a systemd user service. Re-running is safe: every
-# step checks before it creates.
+# and starts the runner as a systemd user service or macOS LaunchAgent.
+# Re-running is safe: every step checks before it creates.
 #
-# Linux or WSL2. On WSL2 the runner needs systemd (wsl.conf [boot] systemd=true);
+# Linux, macOS (Homebrew), or WSL2. On WSL2 the runner needs systemd
+# (wsl.conf [boot] systemd=true);
 # if it is off this script turns it on and tells you to `wsl --shutdown` and
 # re-run.
 
 set -euo pipefail
-HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# Resolve links without GNU readlink -f (unavailable on stock macOS).
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" == /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+HERE=$(cd -P "$(dirname "$SOURCE")" && pwd)
 CONF="$HOME/.config/runlet"
 NO_SERVICE=0
 [[ "${1:-}" == "--no-service" ]] && NO_SERVICE=1
@@ -74,9 +82,31 @@ cf()   { curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" -H 'Content-
 
 # --- 1. dependencies -------------------------------------------------------
 say "Checking dependencies"
+OS=$(uname -s)
+case "$OS" in
+  Darwin)
+    # launchd and fresh Terminal sessions may not have Homebrew on PATH.
+    if ! command -v brew >/dev/null 2>&1; then
+      for brew_bin in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [[ -x "$brew_bin" ]]; then export PATH="$(dirname "$brew_bin"):$PATH"; break; fi
+      done
+    fi
+    command -v brew >/dev/null 2>&1 || die "macOS requires Homebrew. Install it from https://brew.sh, then re-run ./install.sh"
+    RUNLET_BREW_PREFIX=$(brew --prefix)
+    brew install jq coreutils openssl@3 python
+    export PATH="$RUNLET_BREW_PREFIX/opt/coreutils/libexec/gnubin:$RUNLET_BREW_PREFIX/opt/openssl@3/bin:$RUNLET_BREW_PREFIX/bin:$PATH"
+    ;;
+  Linux) ;;
+  *) die "unsupported operating system: $OS (use Linux, macOS, or WSL2)" ;;
+esac
 need_apt=()
-for d in curl jq openssl; do command -v "$d" >/dev/null 2>&1 || need_apt+=("$d"); done
-if (( ${#need_apt[@]} )); then
+if [[ "$OS" == Linux ]]; then
+  for d in curl jq openssl; do command -v "$d" >/dev/null 2>&1 || need_apt+=("$d"); done
+  if ! command -v timeout >/dev/null 2>&1 || ! command -v shuf >/dev/null 2>&1; then need_apt+=(coreutils); fi
+  command -v setsid >/dev/null 2>&1 || need_apt+=(util-linux)
+fi
+if [[ -n "${need_apt[*]:-}" ]]; then
+  command -v apt-get >/dev/null 2>&1 || die "install the missing packages with your package manager: ${need_apt[*]}"
   note "installing: ${need_apt[*]}"
   sudo apt-get update -qq && sudo apt-get install -y -qq "${need_apt[@]}"
 fi
@@ -84,7 +114,14 @@ node_ok=0
 if command -v node >/dev/null 2>&1; then
   v=$(node -v | sed 's/^v//' | cut -d. -f1); (( v >= 20 )) && node_ok=1
 fi
+if (( ! node_ok )) && [[ "$OS" == Darwin ]]; then
+  note "installing Node 22 (Homebrew)"
+  brew install node@22
+  export PATH="$RUNLET_BREW_PREFIX/opt/node@22/bin:$PATH"
+  node_ok=1
+fi
 if (( ! node_ok )); then
+  command -v apt-get >/dev/null 2>&1 || die "install Node 22 and npm with your package manager, then re-run ./install.sh"
   note "installing Node 22 (NodeSource)"
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - >/dev/null
   sudo apt-get install -y -qq nodejs
@@ -211,12 +248,16 @@ RUNLET_SITE=$RUNLET_SITE
 RUNLET_WORKER_NAME=$WORKER_NAME
 RUNLET_DB_NAME=$DB_NAME
 RUNLET_DB_ID=$DB_ID
-RUNLET_KEY_FILE=$CONF/relay.key
 RUNLET_URL_SECRET=$URL_SECRET
 RUNLET_WORKER_URL=$WORKER_URL
 RUNLET_POLL=5
 RUNLET_CMD_TIMEOUT=600
 EOF
+# Shell quoting also supports home directories with spaces.
+printf 'RUNLET_KEY_FILE=%q\n' "$CONF/relay.key" >> "$CONF/env"
+if [[ "$OS" == Darwin ]]; then
+  printf 'RUNLET_BREW_PREFIX=%q\n' "$RUNLET_BREW_PREFIX" >> "$CONF/env"
+fi
 chmod 600 "$CONF/env"
 chmod +x "$HERE/runlet.sh"
 # `runlet` on PATH, so `runlet --help` is there to find: ~/.local/bin is on
@@ -249,6 +290,44 @@ note "queued #$rid, ran it, read the output back: OK"
 # --- 9. the service ----------------------------------------------------------
 if (( NO_SERVICE )); then
   say "Not starting the service (--no-service). Run it with: $HERE/runlet.sh"
+elif [[ "$OS" == Darwin ]]; then
+  say "Starting the runner as a macOS LaunchAgent"
+  AGENT_LABEL=org.runlet.runner
+  AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
+  LOG_DIR="$HOME/Library/Logs/runlet"
+  mkdir -p "$(dirname "$AGENT_PLIST")" "$LOG_DIR"
+  # plistlib escapes XML metacharacters and spaces in paths correctly.
+  python3 - "$AGENT_PLIST" "$HERE" "$HOME" "$PATH" "$LOG_DIR" <<'PYPLIST'
+import plistlib
+import sys
+plist, repo, home, path, logs = sys.argv[1:]
+with open(plist, "wb") as stream:
+    plistlib.dump({
+        "Label": "org.runlet.runner",
+        "ProgramArguments": ["/bin/bash", repo + "/runlet.sh"],
+        "WorkingDirectory": home,
+        "EnvironmentVariables": {"HOME": home, "PATH": home + "/.local/bin:" + path},
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "StandardOutPath": logs + "/runner.log",
+        "StandardErrorPath": logs + "/runner.log",
+    }, stream)
+PYPLIST
+  plutil -lint "$AGENT_PLIST" >/dev/null
+  launch_domain="gui/$(id -u)"
+  if launchctl print "$launch_domain" >/dev/null 2>&1; then
+    # Re-running replaces a loaded definition, and re-enables a disabled one.
+    if launchctl print "$launch_domain/$AGENT_LABEL" >/dev/null 2>&1; then
+      launchctl bootout "$launch_domain/$AGENT_LABEL"
+    fi
+    launchctl enable "$launch_domain/$AGENT_LABEL"
+    launchctl bootstrap "$launch_domain" "$AGENT_PLIST"
+    note "$AGENT_LABEL installed; starts now and at login"
+  else
+    note "LaunchAgent installed; it will start at your next desktop login."
+    note "To run now in this session: $HERE/runlet.sh"
+  fi
 else
   say "Starting the runner as a systemd user service"
   if ! systemctl --user show-environment >/dev/null 2>&1; then
@@ -316,9 +395,14 @@ cat <<EOF
     There: Add custom connector -> paste the URL -> no authentication -> save.
     Then ask Claude to run a command, e.g. "run uname -a on my machine".
 
-    Runner log:  journalctl --user -u runlet -f
     Status:      runlet status        (runlet --help for the rest)
     Skills:      link SKILL.md files into $CONF/skills/ for assistants to find
     Config:      $CONF/env   (token, secret, URL)   $CONF/relay.key
     Re-run this script any time; it keeps existing keys and ids.
 EOF
+if [[ "$OS" == Darwin ]]; then
+  note "Runner log: tail -f \"$HOME/Library/Logs/runlet/runner.log\""
+  note 'If runlet is not on your Terminal PATH, add export PATH="$HOME/.local/bin:$PATH" to ~/.zprofile (zsh) or ~/.bash_profile (bash).'
+else
+  note "Runner log: journalctl --user -u runlet -f"
+fi

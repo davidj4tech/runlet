@@ -1,0 +1,30 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  portability:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: macOS dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install jq coreutils openssl@3 python
+          echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix)/opt/openssl@3/bin" >> "$GITHUB_PATH"
+      - name: Shell syntax (system Bash)
+        run: |
+          /bin/bash -n install.sh
+          /bin/bash -n runlet.sh
+          /bin/bash -n lib/platform.sh
+      - name: Signing compatibility
+        run: /bin/bash tests/check-signing.sh
+      - name: Installer and process behavior
+        run: python3 tests/check-platform.py

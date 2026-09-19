@@ -89,10 +89,12 @@ The short version for an existing Cloudflare user:
    ./install.sh
    ```
 
+   On macOS, install [Homebrew](https://brew.sh) first; the same `./install.sh` sets up dependencies and a login LaunchAgent.
+
    On Windows, run `.\install.ps1` from PowerShell. It uses WSL2 and runs the Linux installer inside Ubuntu.
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
-The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service.
+The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux/WSL) or LaunchAgent (macOS).
 
 Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them.
 
@@ -209,13 +211,21 @@ systemctl --user stop runlet
 systemctl --user start runlet
 ```
 
+On macOS, use `launchctl print "gui/$(id -u)/org.runlet.runner"` and `tail -f "$HOME/Library/Logs/runlet/runner.log"`. See [SETUP.md](SETUP.md#everyday-operation) for stop/start commands. The Mac runs queued work while awake, online, and logged in.
+
 The signing compatibility test keeps the runner's OpenSSL implementation and the Worker's WebCrypto implementation pinned to the same vectors:
 
 ```bash
 ./tests/check-signing.sh
 ```
 
-Run it after changing signing code on either side.
+Run it after changing signing code on either side. Portability checks exercise installer routing with mocked external services and real job execution, timeouts, and cancellation:
+
+```bash
+python3 tests/check-platform.py
+```
+
+The CI matrix runs these checks on Linux and macOS, including the Mac's system Bash. A real Cloudflare installation is still required to validate the complete setup on a target Mac.
 
 ## Deliberate non-features
 
@@ -231,7 +241,9 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `schema.sql` | D1 schema: one command table and its pending-row index. |
 | `runlet.sh` | Local runner: poll, verify, claim, execute, monitor, and report. |
 | `runlet.service` | systemd user-service template. |
-| `install.sh` | Linux/WSL installer and Cloudflare provisioning. |
+| `install.sh` | Linux/macOS/WSL installer and Cloudflare provisioning. |
+| `lib/platform.sh` | macOS dependency paths, process launcher, and load average. |
+| `lib/macos-job.py` | macOS job sessions and cleanup when launchd stops the service. |
 | `install.ps1` | Windows bootstrap through WSL2. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |

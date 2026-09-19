@@ -48,12 +48,21 @@ set -uo pipefail
 # login shell (bash -lc) may reset PATH, but it leaves this alone. Already
 # set means this copy was started BY a command the runner is running.
 IN_JOB=0; [[ -n "${RUNLET:-}" ]] && IN_JOB=1
-export RUNLET
-RUNLET=$(readlink -f "${BASH_SOURCE[0]}")
+# Resolve links without GNU readlink -f (unavailable on stock macOS).
+SOURCE=${BASH_SOURCE[0]}
+while [[ -L "$SOURCE" ]]; do
+  SOURCE_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+  SOURCE=$(readlink "$SOURCE")
+  [[ "$SOURCE" == /* ]] || SOURCE="$SOURCE_DIR/$SOURCE"
+done
+HERE=$(cd -P "$(dirname "$SOURCE")" && pwd)
+export RUNLET="$HERE/$(basename "$SOURCE")"
 
 CONF_DIR="${RUNLET_CONF:-$HOME/.config/runlet}"
 if [[ -r "$CONF_DIR/env" ]]; then set -a; . "$CONF_DIR/env"; set +a; fi
-HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=lib/platform.sh
+. "$HERE/lib/platform.sh" || exit 1
+runlet_platform_init
 WRANGLER_CFG="${RUNLET_WRANGLER_CONFIG:-$HERE/worker/wrangler.jsonc}"
 DB="${RUNLET_DB_NAME:-runlet}"
 KEY_FILE="${RUNLET_KEY_FILE:-$CONF_DIR/relay.key}"
@@ -145,7 +154,7 @@ if (( IN_JOB )) && [[ -z "${1:-}" || "$1" == --once ]]; then
   usage >&2; exit 2
 fi
 
-for dep in jq openssl timeout; do
+for dep in jq openssl timeout "${RUNLET_PROCESS_DEP}"; do
   command -v "$dep" >/dev/null 2>&1 || { log "missing dependency: $dep"; exit 1; }
 done
 
@@ -168,7 +177,7 @@ if [[ "${1:-}" == skills ]]; then
   dir="${RUNLET_SKILLS_DIR:-$CONF_DIR/skills}"
   shopt -s nullglob
   entries=("$dir"/*)
-  if (( ${#entries[@]} == 0 )); then
+  if [[ -z "${entries[*]:-}" ]]; then
     echo "No skills listed on $(hostname -s 2>/dev/null || hostname). The owner can add one with:"
     echo "  ln -s /path/to/SKILL.md $dir/<name>.md"
     exit 0
@@ -342,7 +351,7 @@ execute_and_write() {  # $1 = id, $2 = command
   local id="$1" command="$2" out rc outf="$STATE_DIR/job.$id.out"
   # setsid: a fresh process group, whose leader writes its own pid down
   # (equal to the group id) before exec'ing the command under timeout.
-  setsid bash -c 'echo $$ > "$1"; exec timeout --kill-after=10 "$2" bash -lc "$3"' _ \
+  runlet_start_session bash -c 'echo $$ > "$1"; exec timeout --kill-after=10 "$2" bash -lc "$3"' _ \
     "$STATE_DIR/job.$id.pgid" "$CMD_TIMEOUT" "$command" </dev/null >"$outf" 2>&1 &
   wait "$!"; rc=$?
   out=$(head -c "$MAX_OUTPUT" "$outf" 2>/dev/null)
@@ -433,7 +442,7 @@ poll() {
   local rows load where
   reload_tunables
   if [[ "$LOAD_MAX" != 0 ]]; then
-    load=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null || echo 0)
+    load=$(runlet_load_average)
     if awk -v l="$load" -v m="$LOAD_MAX" 'BEGIN { exit !(l > m) }'; then
       (( LOAD_HELD )) || log "load average $load is over RUNLET_LOAD_MAX=$LOAD_MAX — not starting new commands until it drops"
       LOAD_HELD=1; return 0

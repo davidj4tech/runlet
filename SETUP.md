@@ -6,7 +6,7 @@ You need:
 
 - a free Cloudflare account
 - this repository
-- Linux, or Windows 10/11 with WSL2
+- Linux, macOS with Homebrew, or Windows 10/11 with WSL2
 - an MCP client that can add a remote/custom server by URL
 
 The target machine does **not** need a public IP, open port, VPN, SSH exposure, or a local AI runtime. The runner makes outbound HTTPS requests to Cloudflare.
@@ -54,6 +54,27 @@ cd runlet
 
 Paste the Cloudflare API token when prompted.
 
+### macOS
+
+Install [Homebrew](https://brew.sh) first if it is not already installed, then run the same installer in Terminal:
+
+```bash
+cd runlet
+./install.sh
+```
+
+The installer finds Homebrew on Apple Silicon (`/opt/homebrew`) or Intel (`/usr/local`), or uses the `brew` already on your PATH. It installs `jq`, GNU coreutils, OpenSSL 3, and Python 3. If a suitable Node is missing, it installs Homebrew's Node 22 for Cloudflare provisioning.
+
+It creates `~/Library/LaunchAgents/org.runlet.runner.plist`, starts it in your desktop login session, and starts it again at future logins. When installing over SSH without a desktop login, the agent is saved for your next login; you can run `./runlet.sh` manually meanwhile. `./install.sh --no-service` skips LaunchAgent creation and startup.
+
+The runner uses Homebrew's GNU utilities internally; your shell configuration is not changed. To make `runlet` available in Terminal, add this to `~/.zprofile` (zsh) or `~/.bash_profile` (bash), then open a new terminal:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The Mac must be awake and connected to process commands. This is a per-user login agent, not a system-wide daemon.
+
 ### Windows
 
 Runlet uses WSL2 on Windows so the same runner and systemd service work on both platforms.
@@ -93,7 +114,7 @@ The installer:
 9. deploys the Worker
 10. runs an end-to-end smoke test
 11. writes local config under `~/.config/runlet/`
-12. installs and starts Runlet as a systemd user service
+12. installs and starts Runlet as a systemd user service (Linux/WSL) or LaunchAgent (macOS)
 
 `<site>` defaults to the hostname. Several machines can therefore share one Cloudflare account without sharing a Worker or database.
 
@@ -151,7 +172,7 @@ Adapt that to your own trust model. Runlet provides transport and verification; 
 
 ## Everyday operation
 
-The runner starts automatically as a systemd user service.
+On Linux/WSL, the runner starts automatically as a systemd user service.
 
 ```bash
 systemctl --user status runlet
@@ -166,6 +187,23 @@ Stop and start it with:
 systemctl --user stop runlet
 systemctl --user start runlet
 ```
+
+On macOS, inspect the agent and follow its log with:
+
+```bash
+launchctl print "gui/$(id -u)/org.runlet.runner"
+tail -f "$HOME/Library/Logs/runlet/runner.log"
+runlet status
+```
+
+Stop and start it with:
+
+```bash
+launchctl bootout "gui/$(id -u)/org.runlet.runner"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/org.runlet.runner.plist"
+```
+
+These commands apply to your desktop login session. Logging out stops the agent; logging in starts it again. Logs append to `runner.log`; rotate or truncate that file periodically if needed.
 
 ## Rotate the connector URL
 
@@ -234,6 +272,8 @@ systemctl --user status runlet
 journalctl --user -u runlet -n 100
 ```
 
+On macOS, use the `launchctl print` and `tail` commands above instead.
+
 A stopped runner, Cloudflare API problem, bad local config, or active load ceiling can leave work pending.
 
 ### A command says `rejected`
@@ -268,6 +308,13 @@ Stop and disable the local service:
 
 ```bash
 systemctl --user disable --now runlet
+```
+
+On macOS, unload the agent and remove its login definition instead:
+
+```bash
+launchctl bootout "gui/$(id -u)/org.runlet.runner"
+rm "$HOME/Library/LaunchAgents/org.runlet.runner.plist"
 ```
 
 You can then remove the local config and repository. To remove the cloud side too, delete the Runlet Worker and D1 database from Cloudflare.
