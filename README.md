@@ -77,6 +77,8 @@ There is no persistent shell session between calls, and no requirement for Claud
 
 For the complete walkthrough, see **[SETUP.md](SETUP.md)**.
 
+To reach an Android phone from a Runlet host, see [Developer options and ADB setup](ANDROID.md). Native Android app support is still proposed.
+
 The short version for an existing Cloudflare user:
 
 1. Create a Custom API token with these **Account** permissions:
