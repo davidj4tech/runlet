@@ -92,8 +92,10 @@ esac
         plist = self.home / "Library/LaunchAgents/org.runlet.runner.plist"
         with plist.open("rb") as stream:
             agent = plistlib.load(stream)
-        self.assertEqual(agent["ProgramArguments"], ["/bin/bash", str(self.repo / "runlet.sh")])
+        self.assertEqual(agent["ProgramArguments"], ["/bin/bash", str((self.repo / "runlet.sh").resolve())])
         self.assertEqual(agent["EnvironmentVariables"]["HOME"], str(self.home))
+        if sys.platform == "darwin":
+            subprocess.run(["/usr/bin/plutil", "-lint", str(plist)], check=True, capture_output=True)
         self.assertTrue(agent["KeepAlive"])
         self.assertIn(str(self.prefix), agent["EnvironmentVariables"]["PATH"])
         self.assertEqual(agent["StandardErrorPath"], str(self.home / "Library/Logs/runlet/runner.log"))
