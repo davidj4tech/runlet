@@ -141,7 +141,10 @@ esac
         self.install()
         self.assertTrue((self.home / ".config/systemd/user/runlet.service").exists())
         calls = self.log.read_text()
-        self.assertIn("systemctl --user enable --now runlet", calls)
+        # enable, then restart: --now only starts a STOPPED unit, so a re-run
+        # that changed ExecStart would leave the old runner going.
+        self.assertIn("systemctl --user enable runlet", calls)
+        self.assertIn("systemctl --user restart runlet", calls)
         self.assertNotIn("launchctl", calls)
         self.assertNotIn("brew install", calls)
 
