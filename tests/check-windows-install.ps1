@@ -141,11 +141,48 @@ Test-Case 'the scheduled task runs the runner hidden, at logon, without a time l
   Assert-Equal 'IgnoreNew' $t.Settings.MultipleInstances 'two runners could poll the same queue'
   Assert-True ($t.Trigger.CimClass.CimClassName -eq 'MSFT_TaskLogonTrigger') 'the task does not start at logon'
   Assert-Equal 'Limited' $t.Principal.RunLevel 'the runner must not run elevated'
+  # Without stringifying, every logged line becomes a PowerShell error block.
+  Assert-True ($t.Argument -match 'ToString\(\)') 'the log would be full of ErrorRecord formatting'
+  # The whole command is one double-quoted argument. A nested pair is eaten by
+  # Windows argument parsing, which silently degraded { "$_" } to { $_ } and
+  # turned the line above back into a no-op. Two quotes total: the wrapping pair.
+  Assert-Equal 2 ([regex]::Matches($t.Argument, '"')).Count 'nested double quotes in the task command will be eaten'
   # A workgroup machine has USERDOMAIN=WORKGROUP, which maps to no account and
   # makes Register-ScheduledTask fail outright.
   $whoami = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
   Assert-Equal $whoami $t.Principal.UserId 'the principal is not an identity Windows can resolve'
   Assert-True ($t.Principal.UserId -notmatch 'WORKGROUP') 'WORKGROUP is not a real domain'
+}
+
+# npm.ps1 and wrangler.ps1 sit beside their .cmd files and PowerShell prefers
+# them; npm's shim reads $MyInvocation.Statement, which Set-StrictMode -Version
+# Latest makes fatal. Calling either by bare name breaks the whole install.
+Test-Case 'node tooling is invoked through .cmd, never the .ps1 shims' {
+  $src = [IO.File]::ReadAllLines((Join-Path $Root 'install.ps1'))
+  $bad = @()
+  for ($i = 0; $i -lt $src.Count; $i++) {
+    $line = $src[$i]
+    if ($line -match '^\s*#') { continue }
+    if ($line -match '&\s*npm\s' -or $line -match '&\s*wrangler\s') { $bad += "$($i+1): $line" }
+  }
+  Assert-True ($bad.Count -eq 0) "bare npm/wrangler invocation would hit the .ps1 shim:`n        $($bad -join "`n        ")"
+  Assert-True (($src -join "`n") -match 'Resolve-NodeTool') 'the .cmd resolver is gone'
+}
+
+# 2>&1 turns a native command's stderr into ErrorRecords, and under
+# $ErrorActionPreference = 'Stop' the first one kills the install. The runner
+# logs to stderr by design, so the redirect belongs only inside Invoke-Native,
+# which relaxes the preference around it.
+Test-Case 'stderr is only merged inside Invoke-Native' {
+  $src = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
+  # Two legitimate uses: inside Invoke-Native, and in the Scheduled Task's
+  # inner command, which is a fresh process at the default preference.
+  $code = ($src -split "`n" | Where-Object { $_ -notmatch '^\s*#' }) -join "`n"
+  $count = ([regex]::Matches($code, [regex]::Escape('2>&1'))).Count
+  Assert-Equal 2 $count 'stderr is merged somewhere it would be fatal'
+  Assert-True ($code -match [regex]::Escape("Out-File -FilePath '") ) 'the task no longer logs the runner'
+  Assert-True ($src -match 'function Invoke-Native') 'the safe wrapper is gone'
+  Assert-True ($src -match "ErrorActionPreference = 'Continue'") 'the wrapper no longer relaxes the preference'
 }
 
 Test-Case 'the runlet shim calls the runner and forwards its arguments' {

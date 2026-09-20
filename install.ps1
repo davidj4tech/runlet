@@ -48,6 +48,36 @@ function Write-Say  { param([string]$m) Write-Host "`n==> $m" -ForegroundColor W
 function Write-Note { param([string]$m) Write-Host "    $m" }
 function Stop-Install { param([string]$m) throw $m }
 
+# npm and wrangler each ship a .ps1 shim beside their .cmd, and PowerShell
+# prefers the .ps1. npm's does `if ($MyInvocation.Statement)`, which
+# Set-StrictMode -Version Latest turns into a hard error ("The property
+# 'Statement' cannot be found on this object"), so a bare `npm` call fails
+# before npm itself starts. Always go through the .cmd.
+function Resolve-NodeTool {
+  param([Parameter(Mandatory)][string]$Name)
+  $cmd = Get-Command "$Name.cmd" -ErrorAction SilentlyContinue
+  if ($cmd) { return $cmd.Source }
+  $any = Get-Command $Name -ErrorAction SilentlyContinue
+  if ($any) { return $any.Source }
+  $null
+}
+
+# Merging a native command's stderr into the pipeline (2>&1) turns every
+# stderr line into an ErrorRecord, and with $ErrorActionPreference = 'Stop'
+# the first one is fatal. The runner logs to stderr by design, exactly as
+# runlet.sh does, so capture its output with the preference relaxed and judge
+# it by its exit code instead.
+function Invoke-Native {
+  param([Parameter(Mandatory)][string]$Exe, [string[]]$Arguments = @())
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $out = & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+    $code = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $prev }
+  [pscustomobject]@{ ExitCode = $code; Output = @($out) }
+}
+
 function Get-RunletConf {
   if ($env:RUNLET_CONF) { return $env:RUNLET_CONF }
   Join-Path $env:APPDATA 'runlet'
@@ -192,7 +222,20 @@ function Register-RunletTask {
     [Parameter(Mandatory)][string]$LogPath,
     [switch]$WhatIfOnly
   )
-  $inner = "& '$NodeExe' '$RunnerScript' 2>&1 | Out-File -FilePath '$LogPath' -Append -Encoding utf8"
+  # The merge is safe here: this runs in a fresh powershell.exe whose
+  # $ErrorActionPreference is the default 'Continue', so the runner's stderr
+  # reaches the log instead of killing the process.
+  # .ToString() before Out-File: with the stderr merge, every line the runner
+  # logs arrives as an ErrorRecord, and Out-File would write its whole
+  # formatted block (CategoryInfo, FullyQualifiedErrorId, a blank line) around
+  # each one. Stringifying leaves just the line the runner wrote.
+  #
+  # .ToString(), not "$_": the whole thing is one -Command argument already in
+  # double quotes, and Windows argument parsing eats a nested pair, silently
+  # turning { "$_" } into { $_ } -- which passes the ErrorRecord straight
+  # through and undoes the fix. Single quotes only, below this line.
+  $inner = "& '$NodeExe' '$RunnerScript' 2>&1 | ForEach-Object { `$_.ToString() } | " +
+           "Out-File -FilePath '$LogPath' -Append -Encoding utf8"
   $argline = "-NoLogo -NonInteractive -NoProfile -WindowStyle Hidden -Command `"$inner`""
   $action  = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argline `
                -WorkingDirectory (Split-Path -Parent $RunnerScript)
@@ -212,7 +255,13 @@ function Register-RunletTask {
   }
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
-  Start-ScheduledTask -TaskName $TaskName
+  # Only start it if it is not already running. MultipleInstances IgnoreNew
+  # refuses a second start, and the refusal is recorded as the task's
+  # LastTaskResult (0x800710E0, "the operator or administrator has refused the
+  # request") -- which is the field SETUP.md tells people to check.
+  if ((Get-ScheduledTask -TaskName $TaskName).State -ne 'Running') {
+    Start-ScheduledTask -TaskName $TaskName
+  }
   Get-ScheduledTask -TaskName $TaskName
 }
 
@@ -289,9 +338,11 @@ if (-not $nodeOk) {
   }
 }
 $NodeExe = (Get-Command node).Source
-Write-Note "node $(& node -v), npm $(& npm -v)"
+$Npm = Resolve-NodeTool -Name 'npm'
+if (-not $Npm) { Stop-Install 'npm was not found beside node' }
+Write-Note "node $(& node -v), npm $(& $Npm -v)"
 Push-Location (Join-Path $Here 'worker')
-try { & npm install --silent --no-audit --no-fund; if ($LASTEXITCODE -ne 0) { Stop-Install 'npm install failed in worker/' } }
+try { & $Npm install --silent --no-audit --no-fund; if ($LASTEXITCODE -ne 0) { Stop-Install 'npm install failed in worker/' } }
 finally { Pop-Location }
 $Wrangler = Join-Path $Here 'worker\node_modules\.bin\wrangler.cmd'
 if (-not (Test-Path $Wrangler)) { Stop-Install "wrangler not found at $Wrangler" }
@@ -442,7 +493,8 @@ foreach ($i in 1..12) {
 if (-not $resp) { Stop-Install "the Worker did not answer at $mcp after a minute" }
 $rid = [regex]::Match($resp.result.content[0].text, '#(\d+)').Groups[1].Value
 if (-not $rid) { Stop-Install "unexpected Worker reply: $($resp.result.content[0].text)" }
-& $NodeExe $Runner --once 2>&1 | ForEach-Object { Write-Note $_ }
+$once = Invoke-Native -Exe $NodeExe -Arguments @($Runner, '--once')
+$once.Output | ForEach-Object { Write-Note $_ }
 $get = @{ jsonrpc = '2.0'; id = 2; method = 'tools/call'
           params = @{ name = 'get_result'; arguments = @{ id = [int]$rid; wait = 30 } } }
 $got = (Invoke-RestMethod -Uri $mcp -Method POST -ContentType 'application/json' `
