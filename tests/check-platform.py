@@ -138,11 +138,27 @@ esac
         self.repo.rename(self.base / "linux-checkout")
         self.repo = self.base / "linux-checkout"
         shutil.copy(ROOT / "runlet.service", self.repo / "runlet.service")
+        # An earlier installer left a SYMLINK at ~/.local/bin/runlet. `cat >`
+        # follows one and writes through it, so the shim silently rewrote the
+        # file it pointed at -- in the repository -- instead of replacing it.
+        canary = self.repo / "canary.txt"
+        canary.write_text("untouched\n")
+        stale = self.home / ".local/bin/runlet"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.symlink_to(canary)
         self.install()
+        self.assertEqual(canary.read_text(), "untouched\n",
+                         "the installer wrote through a stale symlink")
         self.assertTrue((self.home / ".config/systemd/user/runlet.service").exists())
         calls = self.log.read_text()
         # enable, then restart: --now only starts a STOPPED unit, so a re-run
         # that changed ExecStart would leave the old runner going.
+        # A previous installer left a symlink at ~/.local/bin/runlet. `cat >`
+        # follows a symlink and writes through it, so without an rm first the
+        # shim overwrites whatever the link pointed at.
+        shim = self.home / ".local/bin/runlet"
+        self.assertFalse(shim.is_symlink(), "the shim must replace a stale symlink, not write through it")
+        self.assertIn("runlet.mjs", shim.read_text())
         self.assertIn("systemctl --user enable runlet", calls)
         self.assertIn("systemctl --user restart runlet", calls)
         self.assertNotIn("launchctl", calls)

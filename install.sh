@@ -279,6 +279,10 @@ chmod 600 "$CONF/env"
 # the login-shell PATH of most distros, and commands run under bash -lc. A
 # two-line shim rather than a symlink, because the runner is run BY node.
 mkdir -p "$HOME/.local/bin" "$CONF/skills"
+# rm first: an earlier version of this installer put a SYMLINK here, and
+# `cat >` follows a symlink and writes through it -- which silently rewrote
+# the file it pointed at, in the repository, instead of replacing the link.
+rm -f "$HOME/.local/bin/runlet"
 cat > "$HOME/.local/bin/runlet" <<EOF
 #!/bin/sh
 exec "$NODE_BIN/node" "$HERE/runlet.mjs" "\$@"
