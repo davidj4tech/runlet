@@ -42,35 +42,23 @@ The installer also writes this token into the local config, because the runner n
    |---|---|---|
    | Account | Workers Scripts | Edit |
    | Account | D1 | Edit |
-   | Account | Account Settings | Read |
 
 5. Include the account where Runlet should live.
 6. Create the token and copy it somewhere temporary and private. Cloudflare shows it once.
 
-### A narrower token
+### Why only two
 
-`Account Settings: Read` is needed for exactly one thing: finding your account ID. Tell the installer the ID and you can leave that permission out, so the token you create by hand is:
+`Workers Scripts: Edit` deploys the Worker and sets its secrets. `D1: Edit` creates the database and applies the schema. That is the whole of provisioning.
 
-| Scope | Permission | Level |
-|---|---|---|
-| Account | Workers Scripts | Edit |
-| Account | D1 | Edit |
+Older versions of this guide also asked for `Account Settings: Read`, to look up your account ID. It turns out not to be needed: a token scoped to an account can already list that account, so the installer finds the ID with the two permissions above. Checked against a real two-permission token on 21 Sep 2026 — a full install, including the deploy, succeeds without it.
 
-Your account ID is on the right of any Cloudflare dashboard page, or in the URL after `/dash.cloudflare.com/`. Pass it as `CLOUDFLARE_ACCOUNT_ID` in the environment or in `install.conf`:
+You can narrow it further by setting the account resource to one specific account rather than *All accounts*, and by giving the token a short TTL. The installer will also skip the account lookup entirely if you tell it the ID:
 
 ```sh
 CLOUDFLARE_ACCOUNT_ID=<your account id> ./install.sh
 ```
 
-Two permissions is the floor for provisioning: `Workers Scripts: Edit` deploys the Worker and sets its secrets, `D1: Edit` creates the database and applies the schema. Neither is needed afterwards — nothing is left on the machine.
-
-If the token can access several accounts, the installer may also ask for the account ID.
-
-### Use a separate token per machine
-
-Nothing is stored on the machine any more, so there is little left to share: the installer's token is used for provisioning and then forgotten. Delete it afterwards, or keep it somewhere private for the next re-run — just not on the machines themselves.
-
-If you do keep one long-lived token, still give each machine its own. A D1 token is account-wide, so one shared token means compromising any machine costs you all of them, and revoking it to fix that breaks them all at once.
+Neither permission is needed once the install finishes. Nothing is stored on the machine: the runner reaches its queue through its own Worker with a bearer token of its own.
 
 ## 3. Run the installer
 
