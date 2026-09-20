@@ -36,7 +36,9 @@ const cases = {
     const s = urlSecret(5, WORDS);
     const parts = s.split('-');
     assert.equal(parts.length, 5);
-    const list = readFileSync(WORDS, 'utf8').split('\n').filter(Boolean);
+    // /\r?\n/, not '\n': a Windows checkout has CRLF line endings, and
+    // splitting on \n alone leaves a \r on every word.
+    const list = readFileSync(WORDS, 'utf8').split(/\r?\n/).filter(Boolean);
     for (const p of parts) assert.ok(list.includes(p), `'${p}' is not in words.txt`);
   },
 

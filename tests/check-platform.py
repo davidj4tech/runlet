@@ -65,7 +65,10 @@ class BootstrapTests(unittest.TestCase):
         self.with_node()
         result = self.run_install("--no-service")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("node %s/install.mjs --no-service" % self.repo, self.calls())
+        # realpath: macOS resolves /var to /private/var, and install.sh
+        # resolves its own location before handing over.
+        repo = os.path.realpath(self.repo)
+        self.assertIn("node %s/install.mjs --no-service" % repo, self.calls())
 
     def test_installs_node_when_missing(self):
         # No node stub at all: the bootstrap must fetch one before handing over.
@@ -81,6 +84,11 @@ class BootstrapTests(unittest.TestCase):
         self.assertIn("apt-get", self.calls())
 
     def test_macos_without_homebrew_says_so(self):
+        # install.sh probes /opt/homebrew/bin/brew and /usr/local/bin/brew by
+        # absolute path, so on a machine that really has Homebrew its absence
+        # cannot be simulated by emptying PATH.
+        if any(Path(p).exists() for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")):
+            self.skipTest("this machine has Homebrew; its absence cannot be faked")
         self.env["RUNLET_TEST_OS"] = "Darwin"
         (self.bin / "brew").unlink()
         result = self.run_install()
