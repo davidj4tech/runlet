@@ -223,5 +223,23 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(result.strip(), "1.25")
 
 
+class WindowsRunnerTests(unittest.TestCase):
+    """win/runlet.mjs against a mock D1 -- see tests/check-windows.mjs."""
+
+    def test_windows_runner(self):
+        node = shutil.which("node")
+        if node is None:
+            # Non-interactive shells on fnm-managed hosts may not have the
+            # default alias on PATH; look where check-signing.sh looks.
+            alias = Path(os.environ.get("FNM_DIR", Path.home() / ".local/share/fnm"))
+            candidate = alias / "aliases/default/bin/node"
+            node = str(candidate) if candidate.is_file() else None
+        if node is None:
+            self.skipTest("Node is required for the Windows runner tests")
+        result = subprocess.run([node, str(ROOT / "tests/check-windows.mjs")],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

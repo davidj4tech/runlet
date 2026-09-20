@@ -225,6 +225,13 @@ Run it after changing signing code on either side. Portability checks exercise i
 python3 tests/check-platform.py
 ```
 
+The Windows runner is a separate implementation, so it gets its own suite: `win/runlet.mjs` driven against a mock D1, covering execution, timeout, cancel, detach, signature rejection, replay rejection, the serial lane, and env-file reloading. `check-platform.py` runs it too; run it alone while working on the Node runner:
+
+```bash
+node tests/check-windows.mjs            # every case
+node tests/check-windows.mjs basic      # one case
+```
+
 The CI matrix runs these checks on Linux and macOS, including the Mac's system Bash. A real Cloudflare installation is still required to validate the complete setup on a target Mac.
 
 ## Deliberate non-features
@@ -244,10 +251,13 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `install.sh` | Linux/macOS/WSL installer and Cloudflare provisioning. |
 | `lib/platform.sh` | macOS dependency paths, process launcher, and load average. |
 | `lib/macos-job.py` | macOS job sessions and cleanup when launchd stops the service. |
+| `win/runlet.mjs` | Windows runner in Node: the same protocol and signing, native process handling. |
 | `install.ps1` | Windows bootstrap through WSL2. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |
 | `tests/check-signing.sh` | Cross-implementation signing compatibility test. |
+| `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
+| `tests/check-windows.mjs` | The Node runner against `tests/mock-d1.mjs`, a stand-in for the D1 HTTP API. |
 
 ## License
 
