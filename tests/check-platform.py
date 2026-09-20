@@ -254,8 +254,10 @@ class WindowsRunnerTests(unittest.TestCase):
             node = str(candidate) if candidate.is_file() else None
         if node is None:
             self.skipTest("Node is required for the Windows runner tests")
-        result = subprocess.run([node, str(ROOT / "tests/check-windows.mjs")],
-                                text=True, capture_output=True)
+        result = subprocess.run(
+            [node, "--experimental-strip-types", "--experimental-sqlite", "--no-warnings",
+             str(ROOT / "tests/check-windows.mjs")],
+            text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 

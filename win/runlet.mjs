@@ -109,27 +109,12 @@ function reloadTunables() {
   }
 }
 
-// Account and database ids come from the env file, else from wrangler.jsonc,
-// exactly as runlet.sh resolves them. install.sh does not write RUNLET_DB_ID.
-function fromWrangler() {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const f = cfg.RUNLET_WRANGLER_CONFIG
-    || path.join(here, '..', 'worker', 'wrangler.jsonc');
-  try {
-    // jsonc: strip // and /* */ comments and trailing commas before parsing.
-    const raw = readFileSync(f, 'utf8')
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/(^|[^:"'])\/\/.*$/gm, '$1')
-      .replace(/,(\s*[}\]])/g, '$1');
-    const j = JSON.parse(raw);
-    const db = (j.d1_databases ?? [])
-      .find((d) => d.database_name === (cfg.RUNLET_DB_NAME || 'runlet'));
-    return { account: j.account_id, dbId: db?.database_id };
-  } catch { return {}; }
-}
-const fallback = (cfg.CLOUDFLARE_ACCOUNT_ID && cfg.RUNLET_DB_ID) ? {} : fromWrangler();
-const ACCOUNT_ID = cfg.CLOUDFLARE_ACCOUNT_ID || fallback.account;
-const DB_ID = cfg.RUNLET_DB_ID || fallback.dbId;
+// The Worker is the only thing that touches D1. This machine holds a bearer
+// token for its own Worker and no Cloudflare credential at all: a D1 API
+// token is account-wide, so one on every machine would reach every other
+// machine's queue.
+const WORKER_URL = (cfg.RUNLET_WORKER_URL || '').replace(/\/+$/, '');
+const RUNNER_TOKEN = cfg.RUNLET_RUNNER_TOKEN || '';
 
 // --- signing: identical to relay_hmac / relay_ct_equal ----------------------
 // Note the newline between nonce and command — it is part of the signed text.
@@ -191,43 +176,15 @@ if (sub === 'skills') {
   process.exit(0);
 }
 
-if (!/^[0-9a-f-]{36}$/.test(DB_ID ?? '')) {
-  throw new Error('runlet: no D1 database id — set RUNLET_DB_ID in the env file'
-    + ' or point RUNLET_WRANGLER_CONFIG at worker/wrangler.jsonc');
+if (!/^https:\/\//.test(WORKER_URL) || !RUNNER_TOKEN) {
+  throw new Error('runlet: set RUNLET_WORKER_URL and RUNLET_RUNNER_TOKEN in '
+    + `${ENV_FILE} — re-run install.ps1 if this machine predates them`);
 }
-const D1_URL = `https://api.cloudflare.com/client/v4/accounts/${ACCOUNT_ID}`
-  + `/d1/database/${DB_ID}/query`;
-
-// --- D1 ---------------------------------------------------------------------
-async function d1Raw(sql) {
-  const r = await fetch(D1_URL, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${cfg.CLOUDFLARE_API_TOKEN}`,
-               'Content-Type': 'application/json' },
-    body: JSON.stringify({ sql }),
-    signal: AbortSignal.timeout(60_000),
-  });
-  const body = await r.json().catch(() => null);
-  if (!body?.success) {
-    throw new Error(`D1: ${(body?.errors ?? []).map((e) => e.message).join('; ') || r.status}`);
-  }
-  return body.result?.[0] ?? {};
-}
-const d1 = async (sql) => (await d1Raw(sql)).results ?? [];
-// Rows a write changed, 0 on any failure — the maintenance sweeps only log it.
-const d1Changes = async (sql) => {
-  try { return Number((await d1Raw(sql)).meta?.changes ?? 0); } catch { return 0; }
-};
-
-const lit = (s) => String(s).replace(/\u0000/g, '').replace(/'/g, "''");
 
 // `status [n]`: the last rows, newest first -- "is it stuck?" as one command.
 if (sub === 'status') {
-  const n = /^[1-9][0-9]*$/.test(rest[0] ?? '') ? rest[0] : 10;
-  const rows = await d1('SELECT id, status, exit_code, runner, created_at, updated_at, '
-    + "substr(replace(replace(command, char(10), ' '), char(9), ' '), 1, 50) AS command, "
-    + "substr(replace(output, char(10), ' | '), 1, 70) AS output "
-    + `FROM commands ORDER BY id DESC LIMIT ${n};`);
+  const limit = /^[1-9][0-9]*$/.test(rest[0] ?? '') ? Number(rest[0]) : 10;
+  const { rows } = await api('status', { limit });
   for (const r of rows) {
     const code = r.exit_code === null ? '' : ` exit=${r.exit_code}`;
     console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${r.command}`);
@@ -236,9 +193,28 @@ if (sub === 'status') {
   process.exit(0);
 }
 
+// --- the Worker -------------------------------------------------------------
+// Every exchange is POST /runner with an `op`. No SQL is built here any more,
+// so neither is any SQL escaping.
+async function api(op, body = {}) {
+  const r = await fetch(`${WORKER_URL}/runner`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${RUNNER_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ op, runner: RUNNER_ID, ...body }),
+    signal: AbortSignal.timeout(60_000),
+  });
+  // A 404 is what a wrong or missing token looks like, deliberately: the
+  // Worker will not confirm that the runner API is there.
+  if (r.status === 404) {
+    throw new Error('the Worker refused this runner (check RUNLET_RUNNER_TOKEN)');
+  }
+  const out = await r.json().catch(() => null);
+  if (!r.ok || out?.error) throw new Error(`worker: ${out?.error ?? r.status}`);
+  return out;
+}
+
 const writeResult = (id, status, code, output) =>
-  d1(`UPDATE commands SET status = '${status}', exit_code = ${code}, `
-   + `output = '${lit(output)}', updated_at = datetime('now') WHERE id = ${id};`);
+  api('result', { id, status, exitCode: code, output });
 
 // --- execution --------------------------------------------------------------
 // Windows has no process groups in the POSIX sense, and detached is NOT the
@@ -326,23 +302,21 @@ function executeAndWatch(id, command) {
   let lastProgress = Date.now();
   const watcher = setInterval(async () => {
     try {
+      // One request per tick: the progress write and the flag read share a
+      // round trip, where they used to cost one each.
+      let output;
       if (T.PROGRESS_EVERY > 0 && Date.now() - lastProgress >= T.PROGRESS_EVERY * 1000) {
         lastProgress = Date.now();
-        const soFar = head(outFile);
-        if (soFar) {
-          await d1(`UPDATE commands SET output = '${lit(soFar)}', `
-            + `updated_at = datetime('now') WHERE id = ${id} AND status = 'running';`);
-        }
+        output = head(outFile) || undefined;
       }
-      const [row] = await d1('SELECT COALESCE(background, 0) AS bg, '
-        + `COALESCE(cancel, 0) AS c FROM commands WHERE id = ${id};`);
-      if (!cancelled && Number(row?.c) === 1) {
+      const row = await api('heartbeat', { id, output });
+      if (!cancelled && Number(row?.cancel) === 1) {
         cancelled = true;
         log(`#${id}: cancel requested — killing the process tree`);
         await killTreeGracefully(child.pid, 5000, alive);
         return;
       }
-      if (!detached && Number(row?.bg) === 1) {
+      if (!detached && Number(row?.background) === 1) {
         detached = true;
         log(`#${id}: detached after ${Math.round((Date.now() - started) / 1000)}s`
           + ' — it keeps running, the queue moves on');
@@ -380,6 +354,12 @@ const seen = (nonce) =>
 
 // Returns { lane, done } like executeAndWatch; a row that never starts has
 // both already settled.
+//
+// The row arrives already claimed: the Worker's claim is one conditional
+// statement, so no second runner can hold it. What is still ours to check is
+// what the Worker cannot -- that the row carries a signature made with the
+// key only this machine and the Worker share, and a nonce new to this
+// machine.
 async function runOne({ id, command, sig, nonce }) {
   const settled = { lane: Promise.resolve(), done: Promise.resolve() };
   if (seen(nonce)) {
@@ -392,11 +372,6 @@ async function runOne({ id, command, sig, nonce }) {
     await writeResult(id, 'rejected', -1, 'runlet: signature did not verify');
     return settled;
   }
-  // AND status = 'pending' means only one runner can win the row.
-  const claimed = await d1(`UPDATE commands SET status = 'running', `
-    + `runner = '${lit(RUNNER_ID)}', updated_at = datetime('now') `
-    + `WHERE id = ${id} AND status = 'pending' RETURNING id;`);
-  if (!claimed.length) { log(`#${id}: claimed by someone else`); return settled; }
   appendFileSync(SEEN, `${nonce}\n`);     // append-only: safe under parallelism
 
   log(`#${id}: running: ${command.slice(0, 80)}`);
@@ -468,29 +443,17 @@ function trimNonces() {
 
 async function poll() {
   reloadTunables();
-  if (overLoadCeiling()) return;
-  // While the lane is busy only background rows can start, so ask only for
-  // those; otherwise five queued commands could hide one behind them.
-  let where = "status = 'pending'";
-  if (T.PARALLEL === 1 && fgBusy()) where += ' AND background = 1';
-  const rows = await d1('SELECT id, command, sig, nonce, '
-    + `COALESCE(background, 0) AS background FROM commands WHERE ${where} `
-    + 'ORDER BY id LIMIT 5;');
+  if (overLoadCeiling()) return 0;
+  // A claimed row is already 'running', so ask only for what can start this
+  // moment; anything else would be marked running with nothing running it.
+  const bg = Math.max(0, T.BACKGROUND_MAX - bgJobs.size);
+  const fg = T.PARALLEL > 1
+    ? Math.max(0, T.PARALLEL - (bgJobs.size + (fgBusy() ? 1 : 0)))
+    : (fgBusy() ? 0 : 1);
+  const { rows } = await api('claim', { fg, bg });
   for (const row of rows) {
-    if (Number(row.background) === 1) {
-      // Its own cap, independent of RUNLET_PARALLEL: the queue stays serial
-      // while a long job runs beside it.
-      while (bgJobs.size >= T.BACKGROUND_MAX) await sleep(500);
-      track(await runOne(row), 'bg');
-    } else if (T.PARALLEL > 1) {
-      while (bgJobs.size + (fgBusy() ? 1 : 0) >= T.PARALLEL) await sleep(500);
-      track(await runOne(row), 'bg');
-    } else {
-      // Serial: one foreground row at a time, oldest first. A busy lane
-      // leaves this row (and every later foreground one) for a later poll.
-      if (fgBusy()) continue;
-      track(await runOne(row), 'fg');
-    }
+    const lane = Number(row.background) === 1 || T.PARALLEL > 1 ? 'bg' : 'fg';
+    track(await runOne(row), lane);
   }
   trimNonces();
   return rows.length;
@@ -500,31 +463,24 @@ async function poll() {
 // Finished rows older than RUNLET_KEEP_DAYS go. The table is the only thing
 // here that grows without bound, and nothing reads an old result.
 async function pruneOld() {
-  const n = await d1Changes("DELETE FROM commands WHERE status NOT IN ('pending', 'running') "
-    + `AND created_at < datetime('now', '-${T.KEEP_DAYS} days');`);
-  if (n > 0) log(`pruned ${n} finished row(s) older than ${T.KEEP_DAYS} days`);
+  const { changed } = await api('prune', { keepDays: T.KEEP_DAYS });
+  if (changed > 0) log(`pruned ${changed} finished row(s) older than ${T.KEEP_DAYS} days`);
 }
 
 // A row still 'running' when this runner starts belonged to a runner that is
 // gone — a restart mid-job takes its children with it. Left alone it would
 // stay 'running' forever and a waiting get_result would only ever time out.
 async function sweepOrphans() {
-  const n = await d1Changes("UPDATE commands SET status = 'error', exit_code = -1, "
-    + "output = 'runlet: the runner restarted while this was running; the command may or may not have completed', "
-    + `updated_at = datetime('now') WHERE status = 'running' `
-    + `AND (runner = '${lit(RUNNER_ID)}' OR runner IS NULL);`);
-  if (n > 0) log(`marked ${n} orphaned 'running' row(s) of runner '${RUNNER_ID}' as error`);
+  const { changed } = await api('sweep', { kind: 'orphans' });
+  if (changed > 0) log(`marked ${changed} orphaned 'running' row(s) of runner '${RUNNER_ID}' as error`);
 }
 
 // A row 'running' past the timeout plus a grace period belonged to a job
 // whose runner hung rather than restarted. Progress writes keep a talkative
 // job's updated_at fresh, so a live job is never caught by this.
 async function sweepStale() {
-  const n = await d1Changes("UPDATE commands SET status = 'error', exit_code = -1, "
-    + "output = 'runlet: ran past the timeout without reporting; the runner may have hung', "
-    + `updated_at = datetime('now') WHERE status = 'running' AND runner = '${lit(RUNNER_ID)}' `
-    + `AND updated_at < datetime('now', '-${T.CMD_TIMEOUT + 120} seconds');`);
-  if (n > 0) log(`marked ${n} stale 'running' row(s) as error`);
+  const { changed } = await api('sweep', { kind: 'stale', staleSeconds: T.CMD_TIMEOUT + 120 });
+  if (changed > 0) log(`marked ${changed} stale 'running' row(s) as error`);
 }
 
 if (sub === '--once') {

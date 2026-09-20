@@ -13,7 +13,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
-import { mockD1, sign } from './mock-d1.mjs';
+import { fakeD1, sign } from './fake-d1.mjs';
+
+// The runner is driven against the REAL Worker, over real SQLite: no mock of
+// the protocol sits between them, so a change to either side that breaks the
+// other fails here.
+const worker = (await import('../worker/src/index.ts')).default;
+const RUNNER_TOKEN = 'runner-token-under-test';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(HERE, '..', 'win', 'runlet.mjs');
@@ -58,9 +64,8 @@ function setup(envLines = {}, ambient = {}) {
   Object.assign(process.env, {
     RUNLET_CONF: conf,
     XDG_STATE_HOME: path.join(TMP, 'state'),
-    CLOUDFLARE_ACCOUNT_ID: '0'.repeat(32),
-    CLOUDFLARE_API_TOKEN: 'test-token',
-    RUNLET_DB_ID: '11111111-2222-3333-4444-555555555555',
+    RUNLET_WORKER_URL: 'https://worker.test',
+    RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
     RUNLET_RUNNER_ID: 'testrunner',
     RUNLET_DETACH_CHECK: '1',
     ...ambient,
@@ -80,8 +85,12 @@ const job = (command, extra = {}) => {
 
 // Start the runner. `mode` is '--once' or 'loop'. Returns the mock's handle.
 async function start(rows, mode = '--once') {
-  const db = mockD1(rows);
-  globalThis.fetch = db.fetchStub;
+  const db = fakeD1(rows);
+  const env = {
+    DB: db.binding, RUNLET_HMAC_KEY: KEY,
+    RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+  };
+  globalThis.fetch = (url, init) => worker.fetch(new Request(url, init), env);
   process.argv = [process.argv[0], RUNNER, ...(mode === '--once' ? ['--once'] : [])];
   // pathToFileURL, not the bare path: on Windows the ESM loader rejects
   // C:\... as an unsupported 'c:' URL scheme.
@@ -127,7 +136,7 @@ const cases = {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
     const db = await start([job(C.startThenSleep(30))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
-    db.row(1).cancel = 1;
+    db.set(1, 'cancel', 1);
     assert.ok(await until(() => db.row(1).status === 'cancelled'), 'never cancelled');
     assert.equal(db.row(1).exit_code, -1);
     assert.match(norm(db.row(1).output), /starting/);
@@ -228,8 +237,8 @@ const cases = {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
     const db = await start([job(C.sleep(25))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
-    db.table.push({ id: 2, status: 'pending', background: 1, cancel: 0, ...job(C.sleep(5)) });
-    db.table.push({ id: 3, status: 'pending', background: 0, cancel: 0, ...job(C.noop) });
+    db.add({ ...job(C.sleep(5)), background: 1 });
+    db.add({ ...job(C.noop) });
     assert.ok(await until(() => db.row(2).status === 'running'),
       'a background row did not start beside a running foreground row');
     assert.equal(db.row(1).status, 'running', 'the foreground row should still be running');
@@ -242,9 +251,9 @@ const cases = {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
     const db = await start([job(C.sleep(6))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
-    db.row(1).background = 1;                       // run_command --detach
+    db.set(1, 'background', 1);                     // run_command --detach
     assert.ok(await until(() => logged(/#1: detached after/)), 'never detached');
-    db.table.push({ id: 2, status: 'pending', background: 0, cancel: 0, ...job(C.noop) });
+    db.add({ ...job(C.noop) });
     assert.ok(await until(() => db.row(2).status === 'done'),
       'the lane was not freed by the detach');
     assert.ok(await until(() => db.row(1).status === 'done'),
@@ -285,11 +294,15 @@ const cases = {
   // `status [n]`: the last rows, newest first, as runlet.sh prints them.
   async statusListing() {
     setup();
-    const db = mockD1([
+    const db = fakeD1([
       { ...job('echo one'), status: 'done', exit_code: 0, output: 'first\nsecond', runner: 'w' },
       { ...job('echo two'), status: 'running', runner: 'w' },
     ]);
-    globalThis.fetch = db.fetchStub;
+    const env = {
+      DB: db.binding, RUNLET_HMAC_KEY: KEY,
+      RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+    };
+    globalThis.fetch = (url, init) => worker.fetch(new Request(url, init), env);
     process.argv = [process.argv[0], RUNNER, 'status', '5'];
     const out = [];
     const realLog = console.log, realExit = process.exit;
@@ -348,7 +361,7 @@ if (name) {
   for (const c of Object.keys(all)) {
     const t0 = Date.now();
     const r = await new Promise((res) => {
-      const p = spawn(process.execPath, [fileURLToPath(import.meta.url), c],
+      const p = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), c],
         { stdio: ['ignore', 'pipe', 'pipe'] });
       let err = '';
       p.stderr.on('data', (d) => { err += d; });

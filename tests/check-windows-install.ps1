@@ -89,6 +89,18 @@ process.stdout.write(JSON.stringify(out));
   Assert-Equal 'a-b-c-d-e' $parsed.RUNLET_URL_SECRET
 }
 
+# The machine that runs commands must not hold an account-wide Cloudflare
+# credential. It reaches its queue through its own Worker instead.
+Test-Case 'the env file never carries the Cloudflare API token' {
+  $src = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
+  $written = [regex]::Match($src, 'Write-EnvFile -Path \$EnvPath -Values \(\[ordered\]@\{(?<body>[\s\S]*?)\}\)')
+  Assert-True $written.Success 'could not find the env file that install.ps1 writes'
+  $body = $written.Groups['body'].Value
+  Assert-True ($body -notmatch 'CLOUDFLARE_API_TOKEN') 'the Cloudflare token is being written to the machine'
+  Assert-True ($body -match 'RUNLET_RUNNER_TOKEN') 'the runner has no credential of its own'
+  Assert-True ($body -match 'RUNLET_WORKER_URL') 'the runner would not know which Worker to call'
+}
+
 Test-Case 'the connector URL is rebuilt from the env file' {
   $f = Join-Path $tmp 'env3'
   Write-EnvFile -Path $f -Values ([ordered]@{ RUNLET_WORKER_URL = 'https://w.s.workers.dev'

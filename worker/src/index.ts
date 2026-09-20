@@ -241,18 +241,29 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
   const id = Number(body?.id)
 
   switch (body?.op) {
-    // Claim up to CLAIM_LIMIT pending rows and return them already claimed.
-    // The runner used to SELECT and then UPDATE, and two runners could race
-    // for the same row; doing both here makes the claim atomic by
-    // construction. `backgroundOnly` is the busy serial lane asking for the
-    // rows it can still start.
+    // Claim pending rows and return them ALREADY claimed. The runner used to
+    // SELECT and then UPDATE, and two runners could race for the same row;
+    // doing both in one statement makes the claim atomic by construction.
+    //
+    // A claimed row is 'running', so a runner must only ask for what it can
+    // start this moment -- hence separate counts. `fg` is the serial lane
+    // (0 while it is busy), `bg` what is left under RUNLET_BACKGROUND_MAX.
+    // Asking for both in one request is why a poll costs one round trip.
     case 'claim': {
-      const where = body?.backgroundOnly ? "status = 'pending' AND background = 1" : "status = 'pending'"
+      const fg = Math.min(Math.max(Number(body?.fg) || 0, 0), CLAIM_LIMIT)
+      const bg = Math.min(Math.max(Number(body?.bg) || 0, 0), CLAIM_LIMIT)
+      if (!fg && !bg) return runnerJson({ rows: [] })
       const { results = [] } = await env.DB.prepare(
         `UPDATE commands SET status = 'running', runner = ?, updated_at = datetime('now')
-         WHERE id IN (SELECT id FROM commands WHERE ${where} ORDER BY id LIMIT ?)
+         WHERE id IN (
+           SELECT id FROM (SELECT id FROM commands WHERE status = 'pending' AND background = 0
+                           ORDER BY id LIMIT ?)
+           UNION ALL
+           SELECT id FROM (SELECT id FROM commands WHERE status = 'pending' AND background = 1
+                           ORDER BY id LIMIT ?)
+         )
          RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background`,
-      ).bind(runner, Math.min(Number(body?.limit) || CLAIM_LIMIT, CLAIM_LIMIT)).all()
+      ).bind(runner, fg, bg).all()
       return runnerJson({ rows: results })
     }
 

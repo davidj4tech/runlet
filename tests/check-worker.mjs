@@ -37,9 +37,9 @@ const cases = {
   async authIsAll404() {
     const f = fakeD1([{ command: 'echo hi' }]);
     const env = envFor(f.binding);
-    assert.equal((await post(env, { op: 'claim' }, { token: 'wrong' })).status, 404);
-    assert.equal((await post(env, { op: 'claim' }, { token: null })).status, 404);
-    assert.equal((await post(env, { op: 'claim' })).status, 200);
+    assert.equal((await post(env, { op: 'claim', fg: 1 }, { token: 'wrong' })).status, 404);
+    assert.equal((await post(env, { op: 'claim', fg: 1 }, { token: null })).status, 404);
+    assert.equal((await post(env, { op: 'claim', fg: 1 })).status, 200);
     // Nothing was claimed by the refused calls.
     assert.equal(f.row(1).status, 'running');
   },
@@ -48,7 +48,7 @@ const cases = {
   async disabledWithoutToken() {
     const f = fakeD1([{ command: 'echo hi' }]);
     const env = envFor(f.binding, { RUNLET_RUNNER_TOKEN: undefined });
-    assert.equal((await post(env, { op: 'claim' })).status, 404);
+    assert.equal((await post(env, { op: 'claim', fg: 1 })).status, 404);
     assert.equal(f.row(1).status, 'pending');
   },
 
@@ -62,28 +62,48 @@ const cases = {
   async claimIsAtomic() {
     const f = fakeD1([{ command: 'one' }, { command: 'two' }]);
     const env = envFor(f.binding);
-    const a = await call(env, { op: 'claim', runner: 'first' });
+    const a = await call(env, { op: 'claim', runner: 'first', fg: 5, bg: 5 });
     assert.equal(a.body.rows.length, 2);
     assert.deepEqual(a.body.rows.map((r) => r.command), ['one', 'two']);
-    const b = await call(env, { op: 'claim', runner: 'second' });
+    const b = await call(env, { op: 'claim', runner: 'second', fg: 5, bg: 5 });
     assert.equal(b.body.rows.length, 0, 'a second claim must not win the same rows');
     assert.equal(f.row(1).runner, 'first');
     assert.equal(f.row(1).status, 'running');
   },
 
-  // A busy serial lane asks only for the rows it may still start, or queued
-  // foreground commands would hide a background one behind them.
-  async claimBackgroundOnly() {
+  // A busy serial lane asks for fg: 0, or queued foreground commands would
+  // hide a background one behind them -- and a row it cannot start would be
+  // left marked 'running' while nothing ran it.
+  async claimBusyLaneTakesBackgroundOnly() {
     const f = fakeD1([{ command: 'fg' }, { command: 'bg', background: 1 }]);
-    const env = envFor(f.binding);
-    const r = await call(env, { op: 'claim', runner: 'w', backgroundOnly: true });
+    const r = await call(envFor(f.binding), { op: 'claim', runner: 'w', fg: 0, bg: 4 });
     assert.deepEqual(r.body.rows.map((x) => x.command), ['bg']);
     assert.equal(f.row(1).status, 'pending', 'the foreground row must be left alone');
   },
 
+  // A free lane takes one foreground row and fills the background slots, in
+  // the same request.
+  async claimTakesBothKinds() {
+    const f = fakeD1([
+      { command: 'fg1' }, { command: 'fg2' },
+      { command: 'bg1', background: 1 }, { command: 'bg2', background: 1 },
+    ]);
+    const r = await call(envFor(f.binding), { op: 'claim', runner: 'w', fg: 1, bg: 4 });
+    assert.deepEqual(r.body.rows.map((x) => x.command).sort(), ['bg1', 'bg2', 'fg1']);
+    assert.equal(f.row(2).status, 'pending', 'only one foreground row was asked for');
+  },
+
+  // Zero capacity must claim nothing at all, not fall back to a default.
+  async claimWithNoCapacityTakesNothing() {
+    const f = fakeD1([{ command: 'fg' }, { command: 'bg', background: 1 }]);
+    const r = await call(envFor(f.binding), { op: 'claim', runner: 'w', fg: 0, bg: 0 });
+    assert.equal(r.body.rows.length, 0);
+    assert.equal(f.all().every((x) => x.status === 'pending'), true);
+  },
+
   async claimIsCapped() {
-    const f = fakeD1(Array.from({ length: 9 }, (_, i) => ({ command: `c${i}` })));
-    const r = await call(envFor(f.binding), { op: 'claim', runner: 'w', limit: 99 });
+    const f = fakeD1(Array.from({ length: 14 }, (_, i) => ({ command: `c${i}` })));
+    const r = await call(envFor(f.binding), { op: 'claim', runner: 'w', fg: 99, bg: 99 });
     assert.equal(r.body.rows.length, 5, 'a caller must not be able to raise the cap');
   },
 

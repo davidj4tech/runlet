@@ -427,6 +427,13 @@ if (-not (Test-Path $KeyPath) -or -not (Get-Item $KeyPath).Length) {
   Protect-File -Path $KeyPath
   Write-Note 'generated relay.key'
 } else { Write-Note 'relay.key exists, keeping it' }
+# The runner's own credential: a bearer token for this machine's Worker, so
+# the machine that executes commands holds no Cloudflare credential at all.
+if ($existing.Contains('RUNLET_RUNNER_TOKEN') -and $existing['RUNLET_RUNNER_TOKEN']) {
+  $runnerToken = $existing['RUNLET_RUNNER_TOKEN']; Write-Note 'runner token exists, keeping it'
+} else {
+  $runnerToken = New-HexSecret -Bytes 32; Write-Note 'generated the runner token'
+}
 if ($existing.Contains('RUNLET_URL_SECRET') -and $existing['RUNLET_URL_SECRET']) {
   $urlSecret = $existing['RUNLET_URL_SECRET']; Write-Note 'URL secret exists, keeping it'
 } else {
@@ -440,6 +447,8 @@ try {
   if ($LASTEXITCODE -ne 0) { Stop-Install 'setting RUNLET_HMAC_KEY failed' }
   $urlSecret | & $Wrangler secret put RUNLET_URL_SECRET | Out-Null
   if ($LASTEXITCODE -ne 0) { Stop-Install 'setting RUNLET_URL_SECRET failed' }
+  $runnerToken | & $Wrangler secret put RUNLET_RUNNER_TOKEN | Out-Null
+  if ($LASTEXITCODE -ne 0) { Stop-Install 'setting RUNLET_RUNNER_TOKEN failed' }
 } finally { Pop-Location }
 Write-Note 'Worker secrets set'
 
@@ -459,8 +468,11 @@ $workerUrl = "https://$workerName.$sub.workers.dev"
 
 # --- 7. local config ---------------------------------------------------------
 Write-Say "Writing $EnvPath"
+# CLOUDFLARE_API_TOKEN is deliberately NOT written here. The runner reaches
+# its queue through the Worker now, and a D1 API token is account-wide: one
+# left on every machine would reach every other machine's queue. Provisioning
+# needs it, this machine does not, so a re-run asks for it again.
 Write-EnvFile -Path $EnvPath -Values ([ordered]@{
-  CLOUDFLARE_API_TOKEN  = $token
   CLOUDFLARE_ACCOUNT_ID = $accountId
   RUNLET_SITE           = $site
   RUNLET_WORKER_NAME    = $workerName
@@ -468,6 +480,7 @@ Write-EnvFile -Path $EnvPath -Values ([ordered]@{
   RUNLET_DB_ID          = $dbId
   RUNLET_URL_SECRET     = $urlSecret
   RUNLET_WORKER_URL     = $workerUrl
+  RUNLET_RUNNER_TOKEN   = $runnerToken
   RUNLET_POLL           = 5
   RUNLET_CMD_TIMEOUT    = 600
   RUNLET_KEY_FILE       = $KeyPath
@@ -535,7 +548,7 @@ Write-Host @"
 
     Status:      runlet status        (runlet --help for the rest)
     Skills:      link SKILL.md files into $Conf\skills\ for assistants to find
-    Config:      $EnvPath   (token, secret, URL)   $KeyPath
+    Config:      $EnvPath   (runner token, URL secret)   $KeyPath
     Runner log:  Get-Content -Wait "$logPath"
     Re-run this script any time; it keeps existing keys and ids.
 "@

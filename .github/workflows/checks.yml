@@ -43,7 +43,7 @@ jobs:
         with:
           node-version: '22'
       - name: Windows runner behavior
-        run: node tests/check-windows.mjs
+        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-windows.mjs
       - name: Windows installer helpers
         # Windows PowerShell 5.1, which is what ships on the machine, not pwsh 7.
         shell: powershell
