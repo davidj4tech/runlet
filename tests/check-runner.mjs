@@ -403,12 +403,18 @@ const cases = {
     await assert.rejects(() => import(pathToFileURL(RUNNER).href), /must be https/);
   },
 
-  // `runlet --help` is what an assistant reads to learn the machine's surface.
-  async helpListsTheSubcommands() {
-    const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8' });
+  // `runlet --help` is what an assistant reads to learn the machine's surface,
+  // so it has to work before there is any config -- no env file, no
+  // relay.key, nothing. A machine that already had one hid this.
+  async helpNeedsNoConfig() {
+    const empty = mkdtempSync(path.join(tmpdir(), 'runlet-noconf-'));
+    const env = { ...process.env, RUNLET_CONF: empty, HOME: empty, USERPROFILE: empty };
+    delete env.RUNLET_KEY;
+    const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
     for (const expected of ['runlet skills', 'runlet status', 'RUNLET_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
+    rmSync(empty, { recursive: true, force: true });
   },
 
   // `status [n]`: the last rows, newest first, as the bash runner printed them.

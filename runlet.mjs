@@ -54,8 +54,12 @@ function loadEnv() {
 // running job is not "on the fly". Only T below is re-read each poll.
 const cfg = { ...process.env, ...loadEnv() };
 
-const KEY = (cfg.RUNLET_KEY
-  ?? readFileSync(cfg.RUNLET_KEY_FILE || path.join(CONF, 'relay.key'), 'utf8')).replace(/\s+/g, '');
+// Read on first use, not at load: `runlet --help` and `runlet skills` must
+// work on a machine that has no config yet, and reading the key eagerly made
+// both die with ENOENT on relay.key.
+let KEY_CACHE = null;
+const key = () => (KEY_CACHE ??= (cfg.RUNLET_KEY
+  ?? readFileSync(cfg.RUNLET_KEY_FILE || path.join(CONF, 'relay.key'), 'utf8')).replace(/\s+/g, ''));
 const RUNNER_ID = cfg.RUNLET_RUNNER_ID || hostname().split('.')[0];
 const MAX_OUTPUT = Number(cfg.RUNLET_MAX_OUTPUT ?? 60000);
 
@@ -117,7 +121,7 @@ const RUNNER_TOKEN = cfg.RUNLET_RUNNER_TOKEN || '';
 // --- signing: identical to relay_hmac / relay_ct_equal ----------------------
 // Note the newline between nonce and command — it is part of the signed text.
 const hmac = (nonce, command) =>
-  createHmac('sha256', KEY).update(`${nonce}\n${command}`).digest('hex');
+  createHmac('sha256', key()).update(`${nonce}\n${command}`).digest('hex');
 
 function ctEqual(a, b) {
   const x = Buffer.from(String(a)), y = Buffer.from(String(b));
