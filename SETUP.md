@@ -47,6 +47,23 @@ The installer also writes this token into the local config, because the runner n
 5. Include the account where Runlet should live.
 6. Create the token and copy it somewhere temporary and private. Cloudflare shows it once.
 
+### A narrower token
+
+`Account Settings: Read` is needed for exactly one thing: finding your account ID. Tell the installer the ID and you can leave that permission out, so the token you create by hand is:
+
+| Scope | Permission | Level |
+|---|---|---|
+| Account | Workers Scripts | Edit |
+| Account | D1 | Edit |
+
+Your account ID is on the right of any Cloudflare dashboard page, or in the URL after `/dash.cloudflare.com/`. Pass it as `CLOUDFLARE_ACCOUNT_ID` in the environment or in `install.conf`:
+
+```sh
+CLOUDFLARE_ACCOUNT_ID=<your account id> ./install.sh
+```
+
+Two permissions is the floor for provisioning: `Workers Scripts: Edit` deploys the Worker and sets its secrets, `D1: Edit` creates the database and applies the schema. Neither is needed afterwards — nothing is left on the machine.
+
 If the token can access several accounts, the installer may also ask for the account ID.
 
 ### Use a separate token per machine

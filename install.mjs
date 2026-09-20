@@ -180,17 +180,25 @@ process.env.CLOUDFLARE_API_TOKEN = token;
 
 const verify = await cf('/user/tokens/verify', { token });
 if (verify.status !== 'active') die('the token did not verify');
-const accounts = await cf('/accounts?per_page=50', { token });
-if (!accounts.length) die('the token can see no accounts; it needs Account Settings: Read');
+// Listing accounts is the ONLY thing here that needs Account Settings: Read.
+// Given the id, the token can be narrower -- Workers Scripts: Edit and D1:
+// Edit are enough to provision -- which matters because whoever installs
+// this has to create that token by hand.
 let accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
-if (!accountId && accounts.length === 1) accountId = accounts[0].id;
-if (!accountId) {
-  note('The token can see several accounts:');
-  for (const a of accounts) console.log(`      ${a.id}  ${a.name}`);
-  accountId = await ask('    Account id to use: ');
+if (accountId) {
+  note(`account ${accountId} (from CLOUDFLARE_ACCOUNT_ID)`);
+} else {
+  const accounts = await cf('/accounts?per_page=50', { token });
+  if (!accounts.length) die('the token can see no accounts; it needs Account Settings: Read, or set CLOUDFLARE_ACCOUNT_ID');
+  if (accounts.length === 1) accountId = accounts[0].id;
+  else {
+    note('The token can see several accounts:');
+    for (const a of accounts) console.log(`      ${a.id}  ${a.name}`);
+    accountId = await ask('    Account id to use: ');
+  }
+  note(`account ${accountId} (${accounts.find((a) => a.id === accountId)?.name ?? '?'})`);
 }
 process.env.CLOUDFLARE_ACCOUNT_ID = accountId;
-note(`account ${accountId} (${accounts.find((a) => a.id === accountId)?.name ?? '?'})`);
 
 // --- 3. D1 -----------------------------------------------------------------------
 say(`D1 database '${dbName}'`);

@@ -84,7 +84,9 @@ The short version for an existing Cloudflare user:
    - **D1: Edit**
    - **Account Settings: Read**
 
-   The installer needs all three, once. It no longer leaves a Cloudflare token on the machine at all: the runner reaches its queue through its own Worker with a per-machine bearer token. See [Use a separate token per machine](SETUP.md#use-a-separate-token-per-machine) for the background.
+   Or two, if you pass `CLOUDFLARE_ACCOUNT_ID` — `Account Settings: Read` is only used to find it. See [A narrower token](SETUP.md#a-narrower-token).
+
+   The installer needs them once. It no longer leaves a Cloudflare token on the machine at all: the runner reaches its queue through its own Worker with a per-machine bearer token. See [Use a separate token per machine](SETUP.md#use-a-separate-token-per-machine) for the background.
 2. Run the installer:
 
    ```bash

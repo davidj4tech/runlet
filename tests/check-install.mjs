@@ -160,6 +160,19 @@ const cases = {
       'an unquoted argument would split on its spaces');
   },
 
+  // Listing accounts is the only call that needs Account Settings: Read, so
+  // with the id supplied the provisioning token can be two permissions
+  // rather than three. Whoever installs this creates that token by hand.
+  accountListingIsSkippedWhenTheIdIsKnown() {
+    const src = readFileSync(path.join(ROOT, 'install.mjs'), 'utf8');
+    const call = src.indexOf("cf('/accounts?per_page=50'");
+    assert.ok(call > 0, 'the account listing is gone entirely');
+    // It must sit inside the branch taken only when the id is unknown.
+    const guard = src.lastIndexOf('if (accountId) {', call);
+    assert.ok(guard > 0 && guard < call, 'the account listing is not behind a check for a known id');
+    assert.match(src, /Workers Scripts: Edit and D1:/);
+  },
+
   everyServiceManagerIsCovered() {
     for (const f of ['service-systemd.mjs', 'service-macos.mjs', 'service-windows.mjs', 'install-lib.mjs']) {
       assert.ok(existsSync(path.join(ROOT, 'lib', f)), `lib/${f} is missing`);
