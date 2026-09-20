@@ -225,9 +225,12 @@ const writeResult = (id, status, code, output) =>
    + `output = '${lit(output)}', updated_at = datetime('now') WHERE id = ${id};`);
 
 // --- execution --------------------------------------------------------------
-// Windows has no process groups in the POSIX sense. The equivalent is to
-// spawn detached (which makes a new process group on win32) and kill the
-// whole tree with taskkill /T, since a bare kill leaves grandchildren alive.
+// Windows has no process groups in the POSIX sense, and detached is NOT the
+// equivalent: on win32 it sets DETACHED_PROCESS, which denies the child a
+// console, and PowerShell 5.1 then exits 0 immediately having run nothing.
+// Detached is for POSIX, where it is setsid() and gives the process group
+// that killTree's process.kill(-pid) needs. On Windows nothing is needed:
+// taskkill /T walks the parent-child tree by pid, which a bare kill misses.
 const SHELL = WIN ? (cfg.RUNLET_SHELL || 'powershell.exe') : '/bin/bash';
 const shellArgs = (command) => WIN
   ? ['-NoLogo', '-NonInteractive', '-NoProfile', '-Command', command]
@@ -279,7 +282,7 @@ function executeAndWatch(id, command) {
   let child;
   try {
     child = spawn(SHELL, shellArgs(command), {
-      detached: true, windowsHide: true, stdio: ['ignore', fd, fd],
+      detached: !WIN, windowsHide: true, stdio: ['ignore', fd, fd],
     });
   } finally { closeSync(fd); }
 

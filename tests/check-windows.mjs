@@ -11,7 +11,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { mockD1, sign } from './mock-d1.mjs';
 
@@ -19,6 +19,29 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RUNNER = path.join(HERE, '..', 'win', 'runlet.mjs');
 const KEY = 'ab'.repeat(32);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const WIN = process.platform === 'win32';
+
+// The jobs the cases queue, in the shell the runner will actually use on this
+// platform: bash -lc, or powershell.exe -Command on Windows. Same observable
+// behaviour either way, so the assertions below stay platform-free.
+const C = {
+  helloExit7: WIN
+    ? "Write-Output 'hello'; [Console]::Error.WriteLine('to-stderr'); exit 7"
+    : 'echo hello; echo to-stderr >&2; exit 7',
+  noop: WIN ? 'exit 0' : 'true',
+  sleep: (s) => (WIN ? `Start-Sleep -Seconds ${s}` : `sleep ${s}`),
+  startThenSleep: (s) => (WIN
+    ? `Write-Output 'starting'; [Console]::Out.Flush(); Start-Sleep -Seconds ${s}`
+    : `echo starting; sleep ${s}`),
+  touch: (f) => (WIN
+    ? `New-Item -ItemType File -Force -Path '${f}' | Out-Null`
+    : `touch '${f}'`),
+  tenAsHundredBs: WIN
+    ? "[Console]::Out.Write('A' * 10); [Console]::Out.Write('B' * 100)"
+    : 'printf "AAAAAAAAAA"; printf "B%.0s" $(seq 1 100)',
+};
+// PowerShell ends its lines with CRLF; the runner keeps bytes as they come.
+const norm = (s) => (s ?? '').replace(/\r\n/g, '\n');
 
 // --- per-case scaffolding ----------------------------------------------------
 let TMP, MARKER, logs = [];
@@ -60,7 +83,9 @@ async function start(rows, mode = '--once') {
   const db = mockD1(rows);
   globalThis.fetch = db.fetchStub;
   process.argv = [process.argv[0], RUNNER, ...(mode === '--once' ? ['--once'] : [])];
-  const loaded = import(RUNNER);
+  // pathToFileURL, not the bare path: on Windows the ESM loader rejects
+  // C:\... as an unsupported 'c:' URL scheme.
+  const loaded = import(pathToFileURL(RUNNER).href);
   if (mode === '--once') await loaded; else loaded.catch((e) => { throw e; });
   return db;
 }
@@ -78,38 +103,41 @@ const cases = {
   // spawn, which throws ERR_INVALID_ARG_VALUE, so every job wedged in 'running'.
   async basic() {
     setup();
-    const db = await start([job('echo hello; echo to-stderr >&2; exit 7')]);
+    const db = await start([job(C.helloExit7)]);
     assert.equal(db.row(1).status, 'done');
     assert.equal(db.row(1).exit_code, 7);
-    assert.equal(db.row(1).output, 'hello\nto-stderr\n');
+    // Both streams land in the one file; their order is the shell's business.
+    assert.match(norm(db.row(1).output), /hello/);
+    assert.match(norm(db.row(1).output), /to-stderr/);
+    if (!WIN) assert.equal(db.row(1).output, 'hello\nto-stderr\n');
   },
 
   async timeout() {
     setup({ RUNLET_CMD_TIMEOUT: 2 });
-    const db = await start([job(`echo starting > ${MARKER}; echo starting; sleep 30`)]);
+    const db = await start([job(C.startThenSleep(30))]);
     assert.equal(db.row(1).status, 'timeout');
     // 124 is what `timeout` gives runlet.sh; both runners must agree.
     assert.equal(db.row(1).exit_code, 124);
-    assert.match(db.row(1).output, /starting/);
-    assert.match(db.row(1).output, /killed after 2s/);
+    assert.match(norm(db.row(1).output), /starting/);
+    assert.match(norm(db.row(1).output), /killed after 2s/);
   },
 
   // A cancel reaches the job once it is up, and the partial output survives.
   async loopCancel() {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
-    const db = await start([job('echo starting; sleep 30')], 'loop');
+    const db = await start([job(C.startThenSleep(30))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     db.row(1).cancel = 1;
     assert.ok(await until(() => db.row(1).status === 'cancelled'), 'never cancelled');
     assert.equal(db.row(1).exit_code, -1);
-    assert.match(db.row(1).output, /starting/);
-    assert.match(db.row(1).output, /cancelled after it had started/);
+    assert.match(norm(db.row(1).output), /starting/);
+    assert.match(norm(db.row(1).output), /cancelled after it had started/);
   },
 
   // A row whose signature does not verify is rejected and never executed.
   async badSignature() {
     setup();
-    const db = await start([job(`touch ${MARKER}`, { sig: 'f'.repeat(64) })]);
+    const db = await start([job(C.touch(MARKER), { sig: 'f'.repeat(64) })]);
     assert.equal(db.row(1).status, 'rejected');
     assert.match(db.row(1).output, /signature did not verify/);
     assert.equal(existsSync(MARKER), false, 'a rejected command must not run');
@@ -120,7 +148,7 @@ const cases = {
     const { nonces } = setup();
     mkdirSync(path.dirname(nonces), { recursive: true });
     writeFileSync(nonces, 'used-before\n');
-    const db = await start([job(`touch ${MARKER}`, { nonce: 'used-before' })]);
+    const db = await start([job(C.touch(MARKER), { nonce: 'used-before' })]);
     assert.equal(db.row(1).status, 'rejected');
     assert.match(db.row(1).output, /replayed nonce/);
     assert.equal(existsSync(MARKER), false, 'a replayed command must not run');
@@ -131,7 +159,7 @@ const cases = {
   async envFileWins() {
     setup({ RUNLET_CMD_TIMEOUT: 2 }, { RUNLET_CMD_TIMEOUT: '60' });
     const started = Date.now();
-    const db = await start([job('sleep 30')]);
+    const db = await start([job(C.sleep(30))]);
     assert.equal(db.row(1).status, 'timeout');
     assert.ok(Date.now() - started < 20000, 'the file value was not used');
   },
@@ -140,7 +168,7 @@ const cases = {
   // directory: a machine that has run both keeps one replay history.
   async stateUnderXdg() {
     const { conf, nonces } = setup();
-    const rows = [job('true')];
+    const rows = [job(C.noop)];
     await start(rows);
     assert.ok(existsSync(nonces), `no nonce file at ${nonces}`);
     assert.match(readFileSync(nonces, 'utf8'), new RegExp(rows[0].nonce));
@@ -148,11 +176,28 @@ const cases = {
       'nonces must not be written into the config directory');
   },
 
+  // With no XDG_STATE_HOME, the default is ~/.local/state — and on Windows,
+  // which has no XDG at all, %LOCALAPPDATA%: machine-local, never roamed.
+  async defaultStateHome() {
+    setup();
+    const home = path.join(TMP, 'userhome');
+    mkdirSync(home, { recursive: true });
+    delete process.env.XDG_STATE_HOME;
+    Object.assign(process.env, { HOME: home, USERPROFILE: home, LOCALAPPDATA: home });
+    const expected = WIN
+      ? path.join(home, 'runlet', 'nonces')
+      : path.join(home, '.local', 'state', 'runlet', 'nonces');
+    const rows = [job(C.noop)];
+    await start(rows);
+    assert.ok(existsSync(expected), `no nonce file at ${expected}`);
+    assert.match(readFileSync(expected, 'utf8'), new RegExp(rows[0].nonce));
+  },
+
   // RUNLET_NONCE_FILE relocates it, as it does for runlet.sh.
   async nonceFileOverride() {
     const custom = path.join(mkdtempSync(path.join(tmpdir(), 'runlet-nonce-')), 'deep', 'n');
     setup({}, { RUNLET_NONCE_FILE: custom });
-    const rows = [job('true')];
+    const rows = [job(C.noop)];
     await start(rows);
     assert.match(readFileSync(custom, 'utf8'), new RegExp(rows[0].nonce));
   },
@@ -162,7 +207,7 @@ const cases = {
     const { nonces } = setup();
     mkdirSync(path.dirname(nonces), { recursive: true });
     writeFileSync(nonces, Array.from({ length: 6100 }, (_, i) => `old${i}`).join('\n') + '\n');
-    await start([job('true')]);
+    await start([job(C.noop)]);
     const lines = readFileSync(nonces, 'utf8').split('\n').filter(Boolean);
     assert.ok(lines.length <= 5001, `nonce file not trimmed: ${lines.length} lines`);
     assert.ok(lines.length >= 5000, `trimmed too far: ${lines.length} lines`);
@@ -172,7 +217,7 @@ const cases = {
   // a failing command's output is the part that says why.
   async outputIsHeadNotTail() {
     setup({ RUNLET_MAX_OUTPUT: 20 });
-    const db = await start([job('printf "AAAAAAAAAA"; printf "B%.0s" $(seq 1 100)')]);
+    const db = await start([job(C.tenAsHundredBs)]);
     assert.equal(db.row(1).output.length, 20);
     assert.match(db.row(1).output, /^AAAAAAAAAA/);
   },
@@ -181,10 +226,10 @@ const cases = {
   // queued behind it still starts, and a second foreground row still waits.
   async loopLaneDoesNotBlock() {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
-    const db = await start([job('sleep 25')], 'loop');
+    const db = await start([job(C.sleep(25))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
-    db.table.push({ id: 2, status: 'pending', background: 1, cancel: 0, ...job('sleep 5') });
-    db.table.push({ id: 3, status: 'pending', background: 0, cancel: 0, ...job('true') });
+    db.table.push({ id: 2, status: 'pending', background: 1, cancel: 0, ...job(C.sleep(5)) });
+    db.table.push({ id: 3, status: 'pending', background: 0, cancel: 0, ...job(C.noop) });
     assert.ok(await until(() => db.row(2).status === 'running'),
       'a background row did not start beside a running foreground row');
     assert.equal(db.row(1).status, 'running', 'the foreground row should still be running');
@@ -195,11 +240,11 @@ const cases = {
   // Detaching frees the lane; the job is still watched to its result.
   async loopDetach() {
     setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
-    const db = await start([job('sleep 6')], 'loop');
+    const db = await start([job(C.sleep(6))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     db.row(1).background = 1;                       // run_command --detach
     assert.ok(await until(() => logged(/#1: detached after/)), 'never detached');
-    db.table.push({ id: 2, status: 'pending', background: 0, cancel: 0, ...job('true') });
+    db.table.push({ id: 2, status: 'pending', background: 0, cancel: 0, ...job(C.noop) });
     assert.ok(await until(() => db.row(2).status === 'done'),
       'the lane was not freed by the detach');
     assert.ok(await until(() => db.row(1).status === 'done'),
@@ -209,7 +254,7 @@ const cases = {
   // RUNLET_BACKGROUND_MAX caps background rows however many are queued.
   async loopBackgroundMax() {
     setup({ RUNLET_POLL: 1, RUNLET_BACKGROUND_MAX: 1, RUNLET_CMD_TIMEOUT: 60 });
-    const db = await start([job('sleep 4', { background: 1 }), job('sleep 1', { background: 1 })],
+    const db = await start([job(C.sleep(4), { background: 1 }), job(C.sleep(1), { background: 1 })],
       'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     await sleep(1500);
@@ -232,7 +277,7 @@ const cases = {
   // waiting get_result can only ever time out.
   async loopSweepsOrphans() {
     setup({ RUNLET_POLL: 1 });
-    const db = await start([{ ...job('true'), status: 'running', runner: 'testrunner' }], 'loop');
+    const db = await start([{ ...job(C.noop), status: 'running', runner: 'testrunner' }], 'loop');
     assert.ok(await until(() => db.row(1).status === 'error'), 'orphan not swept');
     assert.match(db.row(1).output ?? '', /runner restarted/);
   },
