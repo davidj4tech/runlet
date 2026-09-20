@@ -264,6 +264,14 @@ note('Worker secrets set');
 
 // --- 6. workers.dev subdomain, then deploy -------------------------------------------
 say('Deploying the Worker');
+// Registered here rather than left to `wrangler deploy`. Wrangler will offer
+// to create one, but only as an interactive prompt, and its confirm falls
+// back to NO when stdin is not a terminal -- so a piped install on a fresh
+// account dies with "You need to register a workers.dev subdomain". It skips
+// the prompt and auto-registers when it detects an AI agent is running it
+// (it checks CLAUDECODE among others), which would make this pass under an
+// assistant and fail for the person who ships it. Doing it ourselves is the
+// same either way.
 let sub = (await cf(`/accounts/${accountId}/workers/subdomain`, { token }))?.subdomain;
 if (!sub) {
   sub = `relay-${hex(3)}`;
