@@ -235,10 +235,10 @@ node --experimental-strip-types --experimental-sqlite tests/check-runner.mjs bas
 node --experimental-strip-types --experimental-sqlite tests/check-worker.mjs        # the Worker's runner API
 ```
 
-The installer's own helpers — site names, the env file, secrets, the Scheduled Task definition — are checked separately, because none of them can run anywhere but Windows:
+The installer provisions Cloudflare and cannot be exercised offline, but what it *decides* is pure and is where the bugs have been:
 
-```powershell
-.\tests\check-windows-install.ps1
+```bash
+node tests/check-install.mjs
 ```
 
 The CI matrix runs these checks on Linux and macOS, including the Mac's system Bash. A real Cloudflare installation is still required to validate the complete setup on a target Mac.
@@ -256,15 +256,20 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `worker/src/index.ts` | Remote MCP Worker: four tools, signing, queueing, and result retrieval. |
 | `schema.sql` | D1 schema: one command table and its pending-row index. |
 | `runlet.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
-| `install.sh` | Linux/macOS installer and Cloudflare provisioning. |
+| `install.mjs` | The installer on every platform: provisioning, config, and the service. |
+| `install.sh` | Linux/macOS bootstrap: finds Node, hands over to `install.mjs`. |
 | `runlet.service` | systemd user-service template. |
-| `install.ps1` | Windows installer: provisioning, config, and the Scheduled Task. |
+| `install.ps1` | Windows bootstrap: finds Node, hands over to `install.mjs`. |
+| `lib/service-systemd.mjs` | The systemd user service. |
+| `lib/service-macos.mjs` | The macOS LaunchAgent. |
+| `lib/service-windows.mjs` | The Windows Scheduled Task. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |
 | `tests/check-signing.sh` | Cross-implementation signing compatibility test. |
 | `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
 | `tests/check-runner.mjs` | The runner driven against the real Worker over real SQLite. |
-| `tests/check-windows-install.ps1` | `install.ps1`'s helpers, with no Cloudflare access and nothing installed. |
+| `tests/check-install.mjs` | What the installer decides: names, secrets, the env file, each service definition. |
+| `tests/check-windows-install.ps1` | The Windows bootstrap: that it finds Node and hands over. |
 | `tests/check-worker.mjs` | The Worker's runner API, executed against real SQLite via `tests/fake-d1.mjs`. |
 
 ## License

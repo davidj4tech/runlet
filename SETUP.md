@@ -133,6 +133,8 @@ The installer:
 11. writes local config under `~/.config/runlet/` (`%APPDATA%\runlet\` on Windows)
 12. installs and starts `runlet.mjs` as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows)
 
+`install.sh` and `install.ps1` are bootstraps: they make sure Node 20+ is present and hand over to `install.mjs`, which does all of the above on every platform.
+
 `<site>` defaults to the hostname. Several machines can therefore share one Cloudflare account without sharing a Worker or database.
 
 Re-running the installer is safe. Existing stack IDs and secrets are reused unless you deliberately remove or rotate them.

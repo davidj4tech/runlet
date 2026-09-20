@@ -27,6 +27,8 @@ jobs:
         run: /bin/bash tests/check-signing.sh
       - name: Installer and process behavior
         run: python3 tests/check-platform.py
+      - name: Installer decisions
+        run: node tests/check-install.mjs
       - name: Worker runner API
         run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-worker.mjs
       - name: Runner behavior
@@ -43,6 +45,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Installer decisions on Windows
+        run: node tests/check-install.mjs
       - name: Runner behavior on Windows
         run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-runner.mjs
       - name: Windows installer helpers

@@ -3,7 +3,6 @@
 
 import os
 from pathlib import Path
-import plistlib
 import shutil
 import subprocess
 import sys
@@ -19,7 +18,9 @@ def write_executable(path, text):
     path.chmod(0o755)
 
 
-class InstallerTests(unittest.TestCase):
+class BootstrapTests(unittest.TestCase):
+    """install.sh now only finds Node and hands over to install.mjs."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="runlet-test-")
         self.addCleanup(self.temp.cleanup)
@@ -27,142 +28,86 @@ class InstallerTests(unittest.TestCase):
         self.home = self.base / "home with spaces & chars"
         self.repo = self.base / "checkout with spaces & chars"
         self.bin = self.base / "bin"
-        self.prefix = self.base / "brew prefix"
-        self.home.mkdir()
-        self.repo.mkdir()
-        self.bin.mkdir()
-        for name in ("install.sh", "schema.sql", "worker/wrangler.jsonc.template"):
-            dest = self.repo / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(ROOT / name, dest)
-        # Exercise the word-secret path too, without copying the real wordlist.
-        (self.repo / "words.txt").write_text("\n".join(f"word{i}" for i in range(1300)) + "\n")
-        (self.repo / "runlet.mjs").write_text("console.log('runlet-ok')\n")
+        for d in (self.home, self.repo, self.bin):
+            d.mkdir()
+        shutil.copy(ROOT / "install.sh", self.repo / "install.sh")
+        (self.repo / "install.sh").chmod(0o755)
         self.log = self.base / "calls"
-        self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + ":" + os.environ["PATH"],
-                        RUNLET_TEST_LOG=str(self.log), RUNLET_TEST_PREFIX=str(self.prefix),
-                        CLOUDFLARE_API_TOKEN="test-token", RUNLET_SITE="test", SSH_CONNECTION="test",
-                        RUNLET_TEST_OS="Darwin", USER="runlet-test")
-        for key in ("RUNLET", "RUNLET_CONF", "RUNLET_WORKER_NAME", "RUNLET_DB_NAME"):
+        self.env = dict(os.environ, HOME=str(self.home),
+                        PATH=str(self.bin) + ":/usr/bin:/bin",
+                        RUNLET_TEST_LOG=str(self.log), RUNLET_TEST_OS="Linux")
+        for key in ("RUNLET", "RUNLET_CONF"):
             self.env.pop(key, None)
         self.stub("uname", 'echo "${RUNLET_TEST_OS}"')
-        self.stub("brew", 'if [[ "$1" == --prefix ]]; then echo "$RUNLET_TEST_PREFIX"; else echo "brew $*" >> "$RUNLET_TEST_LOG"; fi')
-        self.stub("node", 'echo v22.16.0')
-        self.stub("npm", 'echo "npm $*" >> "$RUNLET_TEST_LOG"; echo 10.0.0')
-        self.stub("launchctl", '''echo "launchctl $*" >> "$RUNLET_TEST_LOG"
-if [[ "$1" == print && "${RUNLET_TEST_HEADLESS:-}" == 1 ]]; then exit 1; fi''')
-        self.stub("plutil", 'echo "plutil $*" >> "$RUNLET_TEST_LOG"')
-        self.stub("systemctl", 'echo "systemctl $*" >> "$RUNLET_TEST_LOG"; [[ "$1" == --user ]]')
-        self.stub("setsid", 'echo "unexpected setsid invocation" >&2; exit 1')
-        self.stub("sudo", 'echo "sudo $*" >> "$RUNLET_TEST_LOG"')
-        self.stub("sleep", ':')
-        self.stub("pbcopy", 'cat >/dev/null')
-        self.stub("curl", '''echo "curl" >> "$RUNLET_TEST_LOG"
-case "$*" in
-  *user/tokens/verify*) echo '{"success":true,"result":{"status":"active"}}' ;;
-  *per_page=50*) echo '{"result":[{"id":"account","name":"test"}]}' ;;
-  *database?*) echo '{"result":[{"name":"runlet-test","uuid":"11111111-1111-1111-1111-111111111111"}]}' ;;
-  *workers/subdomain*) echo '{"result":{"subdomain":"test"}}' ;;
-  *run_command*) echo '{"result":{"content":[{"text":"#1 pending"}]}}' ;;
-  *get_result*) echo '{"result":{"content":[{"text":"#1 done exit=0\\nrunlet-ok"}]}}' ;;
-  *) echo "unexpected curl request" >&2; exit 1 ;;
-esac''')
-        write_executable(self.repo / "worker/node_modules/.bin/wrangler", '''#!/bin/bash
-case "$*" in
-  *PRAGMA*) echo '[{"results":[{"name":"background"},{"name":"cancel"},{"name":"runner"}]}]' ;;
-  *secret*) cat >/dev/null ;;
-  *) echo mock-wrangler ;;
-esac
-''')
+        # Drop sudo's own options only; shifting unconditionally turned
+        # `sudo apt-get install ...` into /usr/bin/install.
+        self.stub("sudo", 'echo "sudo $*" >> "$RUNLET_TEST_LOG"; '
+                          'while [[ "$1" == -* ]]; do shift; done; "$@"')
+        self.stub("apt-get", 'echo "apt-get $*" >> "$RUNLET_TEST_LOG"')
+        self.stub("curl", 'echo "curl $*" >> "$RUNLET_TEST_LOG"')
+        self.stub("brew", 'echo "brew $*" >> "$RUNLET_TEST_LOG"; if [[ "$1" == --prefix ]]; then echo /brew; fi')
 
-    def stub(self, name, script):
-        write_executable(self.bin / name, "#!/bin/bash\nset -eu\n" + script + "\n")
+    def stub(self, name, body):
+        write_executable(self.bin / name, "#!/bin/bash\n" + body + "\n")
 
-    def install(self, *args):
-        result = subprocess.run(["/bin/bash", str(self.repo / "install.sh"), *args],
-                                env=self.env, text=True, capture_output=True, timeout=30)
+    def with_node(self, version="v22.16.0"):
+        self.stub("node", 'if [[ "$1" == -v ]]; then echo "' + version + '"; '
+                          'else echo "node $*" >> "$RUNLET_TEST_LOG"; fi')
+
+    def run_install(self, *args):
+        return subprocess.run(["/bin/bash", str(self.repo / "install.sh"), *args],
+                              env=self.env, text=True, capture_output=True)
+
+    def calls(self):
+        return self.log.read_text() if self.log.exists() else ""
+
+    def test_hands_over_to_install_mjs_with_arguments(self):
+        self.with_node()
+        result = self.run_install("--no-service")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("node %s/install.mjs --no-service" % self.repo, self.calls())
+
+    def test_installs_node_when_missing(self):
+        # No node stub at all: the bootstrap must fetch one before handing over.
+        result = self.run_install()
+        self.assertIn("apt-get", self.calls())
+        self.assertIn("nodesource", self.calls().lower())
+        # It still fails, because the stubbed apt-get installs nothing.
+        self.assertIn("not on PATH", result.stderr + result.stdout)
+
+    def test_old_node_is_replaced(self):
+        self.with_node("v18.19.0")
+        self.run_install()
+        self.assertIn("apt-get", self.calls())
+
+    def test_macos_without_homebrew_says_so(self):
+        self.env["RUNLET_TEST_OS"] = "Darwin"
+        (self.bin / "brew").unlink()
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Homebrew", result.stderr)
+
+    def test_unsupported_os_is_refused(self):
+        self.env["RUNLET_TEST_OS"] = "SunOS"
+        result = self.run_install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported operating system", result.stderr)
+
+
+class InstallerLogicTests(unittest.TestCase):
+    """The installer's own decisions -- see tests/check-install.mjs."""
+
+    def test_install_logic(self):
+        node = shutil.which("node")
+        if node is None:
+            alias = Path(os.environ.get("FNM_DIR", Path.home() / ".local/share/fnm"))
+            candidate = alias / "aliases/default/bin/node"
+            node = str(candidate) if candidate.is_file() else None
+        if node is None:
+            self.skipTest("Node is required for the installer tests")
+        result = subprocess.run([node, str(ROOT / "tests/check-install.mjs")],
+                                text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return result.stdout
-
-    def test_macos_install_and_repeat(self):
-        self.install()
-        config = (self.home / ".config/runlet/env").read_text()
-        key = (self.home / ".config/runlet/relay.key").read_text()
-        plist = self.home / "Library/LaunchAgents/org.runlet.runner.plist"
-        with plist.open("rb") as stream:
-            agent = plistlib.load(stream)
-        # The runner is node now, not bash; the LaunchAgent must say so.
-        self.assertEqual(agent["ProgramArguments"][1], str((self.repo / "runlet.mjs").resolve()))
-        self.assertTrue(agent["ProgramArguments"][0].endswith("node"), agent["ProgramArguments"][0])
-        self.assertEqual(agent["EnvironmentVariables"]["HOME"], str(self.home))
-        if sys.platform == "darwin":
-            subprocess.run(["/usr/bin/plutil", "-lint", str(plist)], check=True, capture_output=True)
-        self.assertTrue(agent["KeepAlive"])
-        self.assertIn(str(self.prefix), agent["EnvironmentVariables"]["PATH"])
-        self.assertEqual(agent["StandardErrorPath"], str(self.home / "Library/Logs/runlet/runner.log"))
-        # Sourcing the generated config must preserve spaces and metacharacters.
-        command = '. "$HOME/.config/runlet/env"; printf "%s\\n%s" "$RUNLET_KEY_FILE" "$RUNLET_BREW_PREFIX"'
-        values = subprocess.check_output(["/bin/bash", "-c", command], env=self.env, text=True)
-        self.assertEqual(values, str(self.home / ".config/runlet/relay.key") + "\n" + str(self.prefix))
-        self.install()
-        self.assertEqual(config, (self.home / ".config/runlet/env").read_text())
-        self.assertEqual(key, (self.home / ".config/runlet/relay.key").read_text())
-        calls = self.log.read_text()
-        self.assertIn("launchctl bootout", calls)
-        self.assertIn("launchctl bootstrap", calls)
-        self.assertNotIn("systemctl", calls)
-        self.assertNotIn("sudo", calls)
-        before = calls
-        self.assertIn("https://runlet-test.test.workers.dev/", self.install("--print-url"))
-        self.assertEqual(before, self.log.read_text())
-
-    def test_no_service(self):
-        self.install("--no-service")
-        self.assertFalse((self.home / "Library/LaunchAgents").exists())
-        self.assertNotIn("launchctl", self.log.read_text())
-
-    def test_headless_install(self):
-        self.env["RUNLET_TEST_HEADLESS"] = "1"
-        self.assertIn("next desktop login", self.install())
-        self.assertNotIn("launchctl bootstrap", self.log.read_text())
-
-    def test_missing_node_uses_homebrew(self):
-        self.stub("node", 'echo v18.0.0')
-        self.install("--no-service")
-        self.assertIn("brew install node@22", self.log.read_text())
-        self.assertNotIn("sudo", self.log.read_text())
-
-    def test_linux_keeps_systemd(self):
-        self.env["RUNLET_TEST_OS"] = "Linux"
-        # Linux's existing service renderer is tested with an ordinary path.
-        self.repo.rename(self.base / "linux-checkout")
-        self.repo = self.base / "linux-checkout"
-        shutil.copy(ROOT / "runlet.service", self.repo / "runlet.service")
-        # An earlier installer left a SYMLINK at ~/.local/bin/runlet. `cat >`
-        # follows one and writes through it, so the shim silently rewrote the
-        # file it pointed at -- in the repository -- instead of replacing it.
-        canary = self.repo / "canary.txt"
-        canary.write_text("untouched\n")
-        stale = self.home / ".local/bin/runlet"
-        stale.parent.mkdir(parents=True, exist_ok=True)
-        stale.symlink_to(canary)
-        self.install()
-        self.assertEqual(canary.read_text(), "untouched\n",
-                         "the installer wrote through a stale symlink")
-        self.assertTrue((self.home / ".config/systemd/user/runlet.service").exists())
-        calls = self.log.read_text()
-        # enable, then restart: --now only starts a STOPPED unit, so a re-run
-        # that changed ExecStart would leave the old runner going.
-        # A previous installer left a symlink at ~/.local/bin/runlet. `cat >`
-        # follows a symlink and writes through it, so without an rm first the
-        # shim overwrites whatever the link pointed at.
-        shim = self.home / ".local/bin/runlet"
-        self.assertFalse(shim.is_symlink(), "the shim must replace a stale symlink, not write through it")
-        self.assertIn("runlet.mjs", shim.read_text())
-        self.assertIn("systemctl --user enable runlet", calls)
-        self.assertIn("systemctl --user restart runlet", calls)
-        self.assertNotIn("launchctl", calls)
-        self.assertNotIn("brew install", calls)
 
 
 class WorkerTests(unittest.TestCase):

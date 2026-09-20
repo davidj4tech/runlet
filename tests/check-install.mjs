@@ -1,0 +1,174 @@
+#!/usr/bin/env node
+// check-install.mjs — the installer's decisions, without installing anything.
+//
+//     node tests/check-install.mjs
+//
+// install.mjs provisions Cloudflare and cannot be exercised here, but what it
+// DECIDES -- names, secrets, what goes in the env file, what each service
+// manager is told -- is pure, and that is where the bugs have been.
+import assert from 'node:assert/strict';
+import { readFileSync, existsSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { siteName, urlSecret, readEnvFile, renderEnv, renderShim,
+         winShellCommand, needsWindowsShell } from '../lib/install-lib.mjs';
+import { plist } from '../lib/service-macos.mjs';
+import { taskCommand } from '../lib/service-windows.mjs';
+
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const WORDS = path.join(ROOT, 'words.txt');
+
+const cases = {
+  // These are install.sh's own outputs, checked against it when it was bash:
+  // one dash per unsafe character, trimmed, capped at 30.
+  siteNamesAreSafe() {
+    assert.equal(siteName('MY_PC'), 'my-pc');
+    assert.equal(siteName('hpo'), 'hpo');
+    assert.equal(siteName('--a  b--'), 'a--b');
+    assert.equal(siteName(''), 'site');
+    assert.equal(siteName('___'), 'site');
+    const long = siteName('x'.repeat(60));
+    assert.ok(long.length <= 30 && /^[a-z0-9-]+$/.test(long), long);
+  },
+
+  urlSecretComesFromTheWordList() {
+    const s = urlSecret(5, WORDS);
+    const parts = s.split('-');
+    assert.equal(parts.length, 5);
+    const list = readFileSync(WORDS, 'utf8').split('\n').filter(Boolean);
+    for (const p of parts) assert.ok(list.includes(p), `'${p}' is not in words.txt`);
+  },
+
+  urlSecretRefusesTooFewWords() {
+    assert.equal(urlSecret(2, WORDS).split('-').length, 5);
+  },
+
+  urlSecretFallsBackToHex() {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'runlet-words-'));
+    writeFileSync(path.join(tmp, 'short.txt'), 'one\ntwo\n');
+    assert.match(urlSecret(5, path.join(tmp, 'short.txt')), /^[0-9a-f]{48}$/);
+    assert.match(urlSecret(5, path.join(tmp, 'absent.txt')), /^[0-9a-f]{48}$/);
+    rmSync(tmp, { recursive: true, force: true });
+  },
+
+  // The machine that runs commands must not hold an account-wide Cloudflare
+  // credential. It reaches its queue through its own Worker instead.
+  envFileCarriesNoCloudflareToken() {
+    const body = renderEnv({
+      accountId: 'acc', site: 'hpo', workerName: 'runlet-hpo', dbName: 'runlet-hpo',
+      dbId: 'id', secret: 'a-b-c-d-e', workerUrl: 'https://w.example',
+      runnerToken: 'tok', keyFile: '/c/relay.key',
+    }, '2026-01-01');
+    assert.ok(!/CLOUDFLARE_API_TOKEN/.test(body), 'the Cloudflare token is being written to the machine');
+    assert.match(body, /^RUNLET_RUNNER_TOKEN=tok$/m);
+    assert.match(body, /^RUNLET_WORKER_URL=https:\/\/w\.example$/m);
+  },
+
+  // The runner parses the file it writes; hold both to the same regex.
+  envFileRoundTripsThroughTheRunnerParser() {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'runlet-env-'));
+    const f = path.join(tmp, 'env');
+    writeFileSync(f, renderEnv({
+      accountId: 'acc', site: 's', workerName: 'w', dbName: 'd', dbId: 'i',
+      secret: 'one-two-three-four-five', workerUrl: 'https://w.example',
+      runnerToken: 'tok', keyFile: '/k',
+    }));
+    const back = readEnvFile(f);
+    assert.equal(back.RUNLET_URL_SECRET, 'one-two-three-four-five');
+    assert.equal(back.RUNLET_WORKER_URL, 'https://w.example');
+    assert.equal(back.CLOUDFLARE_API_TOKEN, undefined);
+    rmSync(tmp, { recursive: true, force: true });
+  },
+
+  shimRunsTheRunnerAndForwardsArguments() {
+    const posix = renderShim({ node: '/n/node', runner: '/r/runlet.mjs', win: false });
+    assert.match(posix, /^#!\/bin\/sh$/m);
+    assert.match(posix, /exec "\/n\/node" "\/r\/runlet\.mjs" "\$@"/);
+    const win = renderShim({ node: 'C:\\n\\node.exe', runner: 'C:\\r\\runlet.mjs', win: true });
+    assert.match(win, /"C:\\n\\node\.exe" "C:\\r\\runlet\.mjs" %\*/);
+  },
+
+  // A plist is XML and these paths can hold & and spaces. install.sh used
+  // Python's plistlib to escape them; this builds the XML itself.
+  plistEscapesPathsAndKeepsTheRunnerFirst() {
+    const xml = plist({
+      node: '/opt/node & co/bin/node', runner: '/home/a b/runlet.mjs',
+      home: '/home/a b', logs: '/home/a b/logs',
+    });
+    assert.ok(!/ & /.test(xml), 'a bare ampersand would make the plist invalid XML');
+    assert.match(xml, /<string>\/opt\/node &amp; co\/bin\/node<\/string>/);
+    assert.match(xml, /<string>\/home\/a b\/runlet\.mjs<\/string>/);
+    assert.match(xml, /<key>KeepAlive<\/key><true\/>/);
+    assert.match(xml, /<key>RunAtLoad<\/key><true\/>/);
+  },
+
+  // Two things this got wrong on a real machine: the log filled with
+  // ErrorRecord blocks, and a nested quote pair was eaten by Windows argument
+  // parsing, silently turning { "$_" } into { $_ }.
+  windowsTaskCommandStringifiesAndAvoidsNestedQuotes() {
+    const cmd = taskCommand({ node: 'C:\\node.exe', runner: 'C:\\runlet.mjs', logPath: 'C:\\runner.log' });
+    assert.match(cmd, /ToString\(\)/);
+    assert.equal((cmd.match(/"/g) ?? []).length, 0, 'a double quote here is eaten by argument parsing');
+    assert.match(cmd, /Out-File -FilePath 'C:\\runner\.log' -Append/);
+  },
+
+  // The bootstraps must do nothing but find Node and hand over; anything else
+  // is logic that would have to exist twice again.
+  bootstrapsOnlyBootstrap() {
+    const sh = readFileSync(path.join(ROOT, 'install.sh'), 'utf8');
+    const ps = readFileSync(path.join(ROOT, 'install.ps1'), 'utf8');
+    assert.match(sh, /exec node "\$HERE\/install\.mjs" "\$@"/);
+    assert.match(ps, /install\.mjs/);
+    for (const [name, text] of [['install.sh', sh], ['install.ps1', ps]]) {
+      for (const gone of ['d1/database', 'wrangler deploy', 'RUNLET_URL_SECRET', 'tokens/verify']) {
+        assert.ok(!text.includes(gone), `${name} still does provisioning: ${gone}`);
+      }
+    }
+  },
+
+  // process.execPath resolves symlinks, so under fnm or nvm it points inside
+  // a version-specific directory that the next upgrade removes. The service
+  // must be given the `node` on PATH, which is the stable alias.
+  serviceUsesThePathNodeNotTheResolvedOne() {
+    const src = readFileSync(path.join(ROOT, 'install.mjs'), 'utf8');
+    assert.match(src, /function nodeForService/);
+    // Only what OUTLIVES this run matters: the three service managers and the
+    // shim. The smoke test may use the interpreter it is already running in.
+    for (const call of ['registerTask({ node: NODE', 'installAgent({ node: NODE',
+                        'installUnit({ node: NODE', 'renderShim({ node: NODE']) {
+      assert.ok(src.includes(call), `this is not given the PATH node: ${call}`);
+    }
+  },
+
+  // Node 20+ refuses to spawn a .cmd without a shell (CVE-2024-27980), and
+  // npm and wrangler on Windows are both .cmd -- it fails with EINVAL before
+  // anything runs. shell: true does not quote arguments, so the command line
+  // has to be built here or a path with a space in it splits.
+  windowsCmdFilesGoThroughTheShellQuoted() {
+    assert.equal(needsWindowsShell('npm.cmd'), true);
+    assert.equal(needsWindowsShell('wrangler.CMD'), true);
+    assert.equal(needsWindowsShell('node.exe'), false);
+    assert.equal(needsWindowsShell('/usr/bin/npm'), false);
+    const line = winShellCommand('C:\\Program Files\\nodejs\\npm.cmd',
+      ['d1', 'execute', 'db', '--file', 'C:\\My Repo\\schema.sql']);
+    assert.equal(line,
+      '"C:\\Program Files\\nodejs\\npm.cmd" "d1" "execute" "db" "--file" "C:\\My Repo\\schema.sql"');
+    assert.ok(!/ (?:--file|C:\\My) /.test(line.replace(/"[^"]*"/g, '')),
+      'an unquoted argument would split on its spaces');
+  },
+
+  everyServiceManagerIsCovered() {
+    for (const f of ['service-systemd.mjs', 'service-macos.mjs', 'service-windows.mjs', 'install-lib.mjs']) {
+      assert.ok(existsSync(path.join(ROOT, 'lib', f)), `lib/${f} is missing`);
+    }
+  },
+};
+
+let failed = 0;
+for (const [name, fn] of Object.entries(cases)) {
+  try { await fn(); console.log(`  ok    ${name}`); }
+  catch (e) { failed++; console.log(`  FAIL  ${name}\n        ${e.message}`); }
+}
+console.log(failed ? `check-install: ${failed} case(s) failed` : `check-install: ${Object.keys(cases).length} cases, all pass`);
+process.exit(failed ? 1 : 0);
