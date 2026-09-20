@@ -28,3 +28,21 @@ jobs:
         run: /bin/bash tests/check-signing.sh
       - name: Installer and process behavior
         run: python3 tests/check-platform.py
+
+  # The Node runner is a separate implementation with its own OS plumbing --
+  # taskkill, powershell.exe, %LOCALAPPDATA% -- that no POSIX runner reaches.
+  # A detached-spawn bug made every Windows job report success having run
+  # nothing, and only a real Windows run could see it.
+  windows-runner:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Windows runner behavior
+        run: node tests/check-windows.mjs
+      - name: Windows installer helpers
+        # Windows PowerShell 5.1, which is what ships on the machine, not pwsh 7.
+        shell: powershell
+        run: .\tests\check-windows-install.ps1

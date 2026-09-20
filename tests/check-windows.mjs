@@ -281,6 +281,29 @@ const cases = {
     assert.ok(await until(() => db.row(1).status === 'error'), 'orphan not swept');
     assert.match(db.row(1).output ?? '', /runner restarted/);
   },
+
+  // `status [n]`: the last rows, newest first, as runlet.sh prints them.
+  async statusListing() {
+    setup();
+    const db = mockD1([
+      { ...job('echo one'), status: 'done', exit_code: 0, output: 'first\nsecond', runner: 'w' },
+      { ...job('echo two'), status: 'running', runner: 'w' },
+    ]);
+    globalThis.fetch = db.fetchStub;
+    process.argv = [process.argv[0], RUNNER, 'status', '5'];
+    const out = [];
+    const realLog = console.log, realExit = process.exit;
+    console.log = (...a) => out.push(a.join(' '));
+    process.exit = () => { throw new Error('__exit__'); };
+    try { await import(pathToFileURL(RUNNER).href); }
+    catch (e) { if (e.message !== '__exit__') throw e; }
+    finally { console.log = realLog; process.exit = realExit; }
+    // Newest first, and a row still running has no exit code to show.
+    assert.match(out[0], /^#2\trunning\t/);
+    assert.ok(!/exit=/.test(out[0]), `a running row must not show an exit code: ${out[0]}`);
+    assert.match(out[2], /^#1\tdone exit=0\t/);
+    assert.match(out[3], /first \| second/);      // newlines folded onto one line
+  },
 };
 
 // Cases that need no database run as subprocesses of the real script.

@@ -6,7 +6,7 @@ You need:
 
 - a free Cloudflare account
 - this repository
-- Linux, macOS with Homebrew, or Windows 10/11 with WSL2
+- Linux, macOS with Homebrew, or Windows 10/11 with Node 20+
 - an MCP client that can add a remote/custom server by URL
 
 The target machine does **not** need a public IP, open port, VPN, SSH exposure, or a local AI runtime. The runner makes outbound HTTPS requests to Cloudflare.
@@ -77,11 +77,13 @@ The Mac must be awake and connected to process commands. This is a per-user logi
 
 ### Windows
 
-Runlet uses WSL2 on Windows so the same runner and systemd service work on both platforms.
+Windows runs natively: `win\runlet.mjs` under Node, started by a Scheduled
+Task at logon. WSL2 is no longer used or required.
 
 1. Put the repository somewhere convenient, for example `C:\runlet`.
-2. Open PowerShell.
-3. Run:
+2. Install [Node 20+](https://nodejs.org) if you do not have it. The installer
+   will try `winget install OpenJS.NodeJS.LTS` for you if winget is available.
+3. Open PowerShell and run:
 
    ```powershell
    cd C:\runlet
@@ -89,15 +91,18 @@ Runlet uses WSL2 on Windows so the same runner and systemd service work on both 
    .\install.ps1
    ```
 
-4. If WSL2 is not installed, the script installs WSL2 and Ubuntu first. Reboot if asked, let Ubuntu finish its first-run setup, choose a Linux username and password, then run the commands above again.
-5. Paste the Cloudflare API token when the Linux installer asks for it.
-6. If the installer reports that systemd is disabled, run:
+4. Paste the Cloudflare API token when it asks.
+5. The runner is registered as the Scheduled Task `runlet`, running as you,
+   starting at logon and restarting if it stops. Check it with:
 
    ```powershell
-   wsl --shutdown
+   Get-ScheduledTask runlet
+   Get-ScheduledTaskInfo runlet
+   Get-Content -Wait "$env:APPDATA\runlet\runner.log"
    ```
 
-   Then run `.\install.ps1` again.
+Config lives in `%APPDATA%\runlet\` rather than `~/.config/runlet/`, and the
+nonce history in `%LOCALAPPDATA%\runlet\`.
 
 ## 4. What the installer creates
 
@@ -113,8 +118,8 @@ The installer:
 8. stores the Worker secrets
 9. deploys the Worker
 10. runs an end-to-end smoke test
-11. writes local config under `~/.config/runlet/`
-12. installs and starts Runlet as a systemd user service (Linux/WSL) or LaunchAgent (macOS)
+11. writes local config under `~/.config/runlet/` (`%APPDATA%\runlet\` on Windows)
+12. installs and starts Runlet as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows)
 
 `<site>` defaults to the hostname. Several machines can therefore share one Cloudflare account without sharing a Worker or database.
 
@@ -172,7 +177,7 @@ Adapt that to your own trust model. Runlet provides transport and verification; 
 
 ## Everyday operation
 
-On Linux/WSL, the runner starts automatically as a systemd user service.
+On Linux, the runner starts automatically as a systemd user service.
 
 ```bash
 systemctl --user status runlet

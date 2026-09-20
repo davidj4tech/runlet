@@ -8,14 +8,15 @@
 //
 // Usage:  node runlet.mjs            poll forever (the service form)
 //         node runlet.mjs --once     one poll, for testing
+//         node runlet.mjs status [n] the last n rows (default 10), newest first
 //         node runlet.mjs skills     the skills listed in RUNLET_SKILLS_DIR
 //         node runlet.mjs sign <nonce> <command>
 //
 // Every tunable runlet.sh re-reads each poll is re-read here too, from the
 // same env file, so editing it is live within one interval on both runners.
 //
-// STATUS: still unrun on real Windows. `status` is the one subcommand of
-// runlet.sh not ported.
+// Verified on Windows (Node 22.20.0, PowerShell 5.1) by tests/check-windows.mjs,
+// which runs on either platform.
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
@@ -220,6 +221,21 @@ const d1Changes = async (sql) => {
 
 const lit = (s) => String(s).replace(/\u0000/g, '').replace(/'/g, "''");
 
+// `status [n]`: the last rows, newest first -- "is it stuck?" as one command.
+if (sub === 'status') {
+  const n = /^[1-9][0-9]*$/.test(rest[0] ?? '') ? rest[0] : 10;
+  const rows = await d1('SELECT id, status, exit_code, runner, created_at, updated_at, '
+    + "substr(replace(replace(command, char(10), ' '), char(9), ' '), 1, 50) AS command, "
+    + "substr(replace(output, char(10), ' | '), 1, 70) AS output "
+    + `FROM commands ORDER BY id DESC LIMIT ${n};`);
+  for (const r of rows) {
+    const code = r.exit_code === null ? '' : ` exit=${r.exit_code}`;
+    console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${r.command}`);
+    console.log(`\t\t\t${r.output ?? ''}`);
+  }
+  process.exit(0);
+}
+
 const writeResult = (id, status, code, output) =>
   d1(`UPDATE commands SET status = '${status}', exit_code = ${code}, `
    + `output = '${lit(output)}', updated_at = datetime('now') WHERE id = ${id};`);
@@ -250,20 +266,26 @@ const head = (file) => {
   } catch { return ''; }
 };
 
+// Returns false when the polite request was refused outright, so the caller
+// can escalate now instead of waiting out a grace period that cannot pass.
 function killTree(pid, force) {
   if (WIN) {
     const args = ['/PID', String(pid), '/T'];
     if (force) args.push('/F');
-    try { execFileSync('taskkill', args, { stdio: 'ignore' }); } catch { /* already gone */ }
-  } else {
-    const sig = force ? 'SIGKILL' : 'SIGTERM';
-    try { process.kill(-pid, sig); } catch { try { process.kill(pid, sig); } catch {} }
+    try { execFileSync('taskkill', args, { stdio: 'ignore' }); return true; }
+    catch { return false; }          // already gone, or "/F required"
   }
+  const sig = force ? 'SIGKILL' : 'SIGTERM';
+  try { process.kill(-pid, sig); } catch { try { process.kill(pid, sig); } catch {} }
+  return true;
 }
 // TERM first, KILL after a grace period, like `timeout --kill-after=10` and
 // cancel_job: a job that traps TERM still gets to clean up before it goes.
+// Windows refuses the polite form for a console process outright ("can only
+// be terminated forcefully"), and says so immediately, so there the grace
+// period is skipped rather than burned -- it cost 10s on every timeout.
 async function killTreeGracefully(pid, graceMs, alive) {
-  killTree(pid, false);
+  if (!killTree(pid, false)) { killTree(pid, true); return; }
   for (let i = 0; i < Math.ceil(graceMs / 1000); i++) {
     if (!alive()) return;
     await sleep(1000);

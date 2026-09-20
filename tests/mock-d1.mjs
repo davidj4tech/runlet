@@ -26,6 +26,14 @@ export function mockD1(rows) {
       results = table.filter((r) => r.status === 'pending' && (!m[1] || r.background === 1))
         .sort((a, b) => a.id - b.id).slice(0, 5)
         .map(({ id, command, sig, nonce, background }) => ({ id, command, sig, nonce, background }));
+    } else if (/^SELECT id, status, exit_code, runner,/.test(sql)) {
+      const limit = Number(/LIMIT (\d+);/.exec(sql)?.[1] ?? 10);
+      results = [...table].sort((a, b) => b.id - a.id).slice(0, limit).map((r) => ({
+        id: r.id, status: r.status, exit_code: r.exit_code, runner: r.runner,
+        created_at: r.created_at, updated_at: r.updated_at,
+        command: r.command.replace(/[\n\t]/g, ' ').slice(0, 50),
+        output: r.output === null ? null : r.output.replace(/\n/g, ' | ').slice(0, 70),
+      }));
     } else if ((m = /^SELECT COALESCE\(background, 0\) AS bg,[\s\S]*WHERE id = (\d+);/.exec(sql))) {
       const r = row(m[1]);
       if (r) results = [{ bg: r.background, c: r.cancel }];

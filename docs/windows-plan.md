@@ -1,26 +1,43 @@
-# Native Windows support — plan (20 Sep 2026)
+# Native Windows support (updated 20 Sep 2026)
 
 ## Where we are
-- macOS support merged into main (fast-forward, commits 0eb4dad + 8aa3a51).
-- lib/platform.sh is the seam: three hooks only —
-  runlet_platform_init (PATH), runlet_start_session (setsid vs macos-job.py),
-  runlet_load_average (/proc/loadavg vs sysctl).
-- install.ps1 (41 lines) currently does nothing but bootstrap WSL2 + Ubuntu and
-  hand off to install.sh. Going native means porting install.sh, not the PowerShell.
+- Native Windows works and is tested on a real machine (HPO: Node 22.20.0,
+  Windows PowerShell 5.1) as well as on `windows-latest` in CI.
+- `win/runlet.mjs` is the runner: same wire protocol, same v1 signature scheme
+  and same D1 schema as `runlet.sh`, with Windows process handling.
+- `install.ps1` is the installer: it provisions Cloudflare, writes
+  `%APPDATA%\runlet\{env,relay.key}` and registers a Scheduled Task. The WSL2
+  bootstrap it used to be is gone.
+- `tests/check-windows.mjs` (19 cases, Linux and Windows) and
+  `tests/check-windows-install.ps1` (10 cases, Windows only) cover both.
 
-## Proposed shape
-- Keep bash for Linux and macOS. Write a Node equivalent of the runner for Windows,
-  sharing the same worker and wire protocol. Node is already a dependency (worker).
-- Windows needs a fourth platform implementation plus Task Scheduler in place of
-  systemd user services / launchd LaunchAgents.
-- Ship a single signed executable rather than a hard WSL2 dependency.
+## What the port actually cost
+Three bugs that only a real Windows run could find, all in plumbing that
+looked obviously correct:
 
-## Notes
-- Skills are SKILL.md markdown, not scripts — nothing to port there.
-- Only genuine Linux dependency in the skill layer is tmux (claude-sessions,
-  resume-tmux, music-transit). A process manager can stand in for it.
-- mopidy / systemctl / snapcast / adb / speech all live on red5 and are reached
-  over the network — they do not constrain the client platform.
+- `spawn` rejects a fresh `createWriteStream` (its `fd` is still `null`), so
+  every job threw after being claimed and wedged its row in `running`.
+- `detached: true` on win32 is not a process group. It sets
+  `DETACHED_PROCESS`, denying the child a console; PowerShell 5.1 then exits 0
+  having run nothing, so every job reported success with no output. Detach on
+  POSIX only; `taskkill /T` walks the tree by pid and needs nothing.
+- `$env:USERDOMAIN` is `WORKGROUP` on a machine that is not domain-joined, and
+  `WORKGROUP\user` maps to no account, so `Register-ScheduledTask` failed
+  outright. `[WindowsIdentity]::GetCurrent().Name` is the resolvable name.
+
+`taskkill` also refuses to stop a console process without `/F` ("can only be
+terminated forcefully"), so the graceful phase before a forced kill is skipped
+on Windows rather than waited out -- it cost 10s on every timeout.
+
+## Still open
+- `runlet.sh --help` has no Windows equivalent; `win/runlet.mjs` documents
+  itself in its header only.
+- No log rotation for `%APPDATA%\runlet\runner.log`. The journal and launchd
+  handle this for the other two platforms; Task Scheduler does not.
+- A single signed executable, so Node is not a prerequisite, remains a
+  packaging question rather than a code one.
+- `install.ps1` has not been run end to end against a real Cloudflare account
+  on Windows; its helpers are tested, its provisioning path is not.
 
 ## Related: agent-media
 - 280 first-party .py files (218 in packages/core).

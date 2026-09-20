@@ -91,10 +91,10 @@ The short version for an existing Cloudflare user:
 
    On macOS, install [Homebrew](https://brew.sh) first; the same `./install.sh` sets up dependencies and a login LaunchAgent.
 
-   On Windows, run `.\install.ps1` from PowerShell. It uses WSL2 and runs the Linux installer inside Ubuntu.
+   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is `win\runlet.mjs` (Node), started by a Scheduled Task at logon.
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
-The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux/WSL) or LaunchAgent (macOS).
+The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows).
 
 Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them.
 
@@ -232,6 +232,12 @@ node tests/check-windows.mjs            # every case
 node tests/check-windows.mjs basic      # one case
 ```
 
+The installer's own helpers — site names, the env file, secrets, the Scheduled Task definition — are checked separately, because none of them can run anywhere but Windows:
+
+```powershell
+.\tests\check-windows-install.ps1
+```
+
 The CI matrix runs these checks on Linux and macOS, including the Mac's system Bash. A real Cloudflare installation is still required to validate the complete setup on a target Mac.
 
 ## Deliberate non-features
@@ -248,16 +254,17 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `schema.sql` | D1 schema: one command table and its pending-row index. |
 | `runlet.sh` | Local runner: poll, verify, claim, execute, monitor, and report. |
 | `runlet.service` | systemd user-service template. |
-| `install.sh` | Linux/macOS/WSL installer and Cloudflare provisioning. |
+| `install.sh` | Linux/macOS installer and Cloudflare provisioning. |
 | `lib/platform.sh` | macOS dependency paths, process launcher, and load average. |
 | `lib/macos-job.py` | macOS job sessions and cleanup when launchd stops the service. |
 | `win/runlet.mjs` | Windows runner in Node: the same protocol and signing, native process handling. |
-| `install.ps1` | Windows bootstrap through WSL2. |
+| `install.ps1` | Windows installer: provisioning, config, and the Scheduled Task. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |
 | `tests/check-signing.sh` | Cross-implementation signing compatibility test. |
 | `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
 | `tests/check-windows.mjs` | The Node runner against `tests/mock-d1.mjs`, a stand-in for the D1 HTTP API. |
+| `tests/check-windows-install.ps1` | `install.ps1`'s helpers, with no Cloudflare access and nothing installed. |
 
 ## License
 
