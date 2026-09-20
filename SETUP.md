@@ -25,7 +25,19 @@ The free plan is sufficient for a small personal install.
 
 ## 2. Create the API token
 
-The installer uses a Cloudflare API token to create the Worker and D1 database. This token is for provisioning; it is not the credential your MCP client uses later.
+The installer uses a Cloudflare API token to create the Worker and D1 database. It is not the credential your MCP client uses — that is the connector URL, created later.
+
+The installer also writes this token into the local config, because the runner needs one of its own: it reaches the queue over D1's HTTP API on every poll. The two uses have different needs, and it is worth knowing which is which.
+
+**The installer** needs all three permissions below: it discovers the account, creates the database, deploys the Worker, and sets the Worker's secrets. It needs them once.
+
+**The runner** calls exactly one endpoint, for as long as it is up:
+
+```text
+POST /accounts/{account}/d1/database/{database}/query
+```
+
+so `D1: Edit` is the only permission it ever uses. Giving a machine the installer's token leaves a deploy-capable account credential sitting on the machine whose job is running shell commands from the internet. See [Use a separate token per machine](#use-a-separate-token-per-machine) below.
 
 1. Open <https://dash.cloudflare.com/profile/api-tokens>.
 2. Click **Create Token** and choose **Create Custom Token**.
@@ -42,6 +54,18 @@ The installer uses a Cloudflare API token to create the Worker and D1 database. 
 6. Create the token and copy it somewhere temporary and private. Cloudflare shows it once.
 
 If the token can access several accounts, the installer may also ask for the account ID.
+
+### Use a separate token per machine
+
+One token shared across machines means compromising any one of them costs you all of them, and revoking it to fix that breaks them all at once. Give each machine its own, and narrow the one that stays behind:
+
+1. Install with a token holding the three permissions above. Delete it afterwards; nothing needs it again until you re-run the installer.
+2. Create a second token with **one** permission — Account / D1 / Edit — scoped to the same account.
+3. Put that one in the machine's config as `CLOUDFLARE_API_TOKEN` (`~/.config/runlet/env`, or `%APPDATA%\runlet\env` on Windows) and restart the runner.
+
+A machine holding a D1-only token can read and write its own queue table and nothing else: it cannot deploy a Worker, enumerate the account, or reach another machine's database.
+
+Re-running the installer needs the wider token again, so paste one in at that moment rather than storing it.
 
 ## 3. Run the installer
 
@@ -220,6 +244,17 @@ If the URL is exposed:
 4. Replace the old connector URL in every MCP client.
 
 The old path stops being valid after the Worker is redeployed with the new secret.
+
+## Rotate a machine's API token
+
+The token in a machine's config can be replaced without touching the Worker, the database, or the connector URL:
+
+1. Create the replacement (Account / D1 / Edit is enough — see [Use a separate token per machine](#use-a-separate-token-per-machine)).
+2. Edit `CLOUDFLARE_API_TOKEN=` in `~/.config/runlet/env`, or `%APPDATA%\runlet\env` on Windows.
+3. Restart the runner: `systemctl --user restart runlet`, `launchctl kickstart -k "gui/$(id -u)/org.runlet.runner"`, or on Windows `Stop-ScheduledTask runlet; Start-ScheduledTask runlet`.
+4. Watch one command run end to end, then delete the old token in the Cloudflare dashboard.
+
+Rotate in that order. Deleting the old token first stops the runner mid-poll.
 
 ## Find a lost connector URL
 

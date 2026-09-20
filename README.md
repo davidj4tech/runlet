@@ -83,6 +83,8 @@ The short version for an existing Cloudflare user:
    - **Workers Scripts: Edit**
    - **D1: Edit**
    - **Account Settings: Read**
+
+   The installer needs all three, once. The runner it leaves behind uses only **D1: Edit** — see [Use a separate token per machine](SETUP.md#use-a-separate-token-per-machine) for why each machine should keep a narrower token of its own.
 2. Run the installer:
 
    ```bash
