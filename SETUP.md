@@ -31,13 +31,7 @@ The installer also writes this token into the local config, because the runner n
 
 **The installer** needs all three permissions below: it discovers the account, creates the database, deploys the Worker, and sets the Worker's secrets. It needs them once.
 
-**The runner** calls exactly one endpoint, for as long as it is up:
-
-```text
-POST /accounts/{account}/d1/database/{database}/query
-```
-
-so `D1: Edit` is the only permission it ever uses. Giving a machine the installer's token leaves a deploy-capable account credential sitting on the machine whose job is running shell commands from the internet. See [Use a separate token per machine](#use-a-separate-token-per-machine) below.
+**The runner** needs no Cloudflare permissions at all. It reaches its queue through its own Worker, with a per-machine bearer token the installer generates, so the machine whose job is running shell commands from the internet holds no account credential. The installer does not write `CLOUDFLARE_API_TOKEN` into the machine's config, which is why a re-run asks for it again.
 
 1. Open <https://dash.cloudflare.com/profile/api-tokens>.
 2. Click **Create Token** and choose **Create Custom Token**.
@@ -57,15 +51,9 @@ If the token can access several accounts, the installer may also ask for the acc
 
 ### Use a separate token per machine
 
-One token shared across machines means compromising any one of them costs you all of them, and revoking it to fix that breaks them all at once. Give each machine its own, and narrow the one that stays behind:
+Nothing is stored on the machine any more, so there is little left to share: the installer's token is used for provisioning and then forgotten. Delete it afterwards, or keep it somewhere private for the next re-run — just not on the machines themselves.
 
-1. Install with a token holding the three permissions above. Delete it afterwards; nothing needs it again until you re-run the installer.
-2. Create a second token with **one** permission — Account / D1 / Edit — scoped to the same account.
-3. Put that one in the machine's config as `CLOUDFLARE_API_TOKEN` (`~/.config/runlet/env`, or `%APPDATA%\runlet\env` on Windows) and restart the runner.
-
-A machine holding a D1-only token can read and write its own queue table and nothing else: it cannot deploy a Worker, enumerate the account, or reach another machine's database.
-
-Re-running the installer needs the wider token again, so paste one in at that moment rather than storing it.
+If you do keep one long-lived token, still give each machine its own. A D1 token is account-wide, so one shared token means compromising any machine costs you all of them, and revoking it to fix that breaks them all at once.
 
 ## 3. Run the installer
 
@@ -89,7 +77,7 @@ cd runlet
 
 The installer finds Homebrew on Apple Silicon (`/opt/homebrew`) or Intel (`/usr/local`), or uses the `brew` already on your PATH. It installs `jq`, GNU coreutils, OpenSSL 3, and Python 3. If a suitable Node is missing, it installs Homebrew's Node 22 for Cloudflare provisioning.
 
-It creates `~/Library/LaunchAgents/org.runlet.runner.plist`, starts it in your desktop login session, and starts it again at future logins. When installing over SSH without a desktop login, the agent is saved for your next login; you can run `./runlet.sh` manually meanwhile. `./install.sh --no-service` skips LaunchAgent creation and startup.
+It creates `~/Library/LaunchAgents/org.runlet.runner.plist`, starts it in your desktop login session, and starts it again at future logins. When installing over SSH without a desktop login, the agent is saved for your next login; you can run `node runlet.mjs` manually meanwhile. `./install.sh --no-service` skips LaunchAgent creation and startup.
 
 The runner uses Homebrew's GNU utilities internally; your shell configuration is not changed. To make `runlet` available in Terminal, add this to `~/.zprofile` (zsh) or `~/.bash_profile` (bash), then open a new terminal:
 
@@ -143,7 +131,7 @@ The installer:
 9. deploys the Worker
 10. runs an end-to-end smoke test
 11. writes local config under `~/.config/runlet/` (`%APPDATA%\runlet\` on Windows)
-12. installs and starts Runlet as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows)
+12. installs and starts `runlet.mjs` as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows)
 
 `<site>` defaults to the hostname. Several machines can therefore share one Cloudflare account without sharing a Worker or database.
 
@@ -206,8 +194,8 @@ On Linux, the runner starts automatically as a systemd user service.
 ```bash
 systemctl --user status runlet
 journalctl --user -u runlet -f
-runlet.sh status
-runlet.sh status 30
+runlet status
+runlet status 30
 ```
 
 Stop and start it with:
@@ -245,16 +233,15 @@ If the URL is exposed:
 
 The old path stops being valid after the Worker is redeployed with the new secret.
 
-## Rotate a machine's API token
+## Rotate a machine's runner token
 
-The token in a machine's config can be replaced without touching the Worker, the database, or the connector URL:
+`RUNLET_RUNNER_TOKEN` is what a machine presents to its own Worker. Replacing it touches neither the database nor the connector URL:
 
-1. Create the replacement (Account / D1 / Edit is enough — see [Use a separate token per machine](#use-a-separate-token-per-machine)).
-2. Edit `CLOUDFLARE_API_TOKEN=` in `~/.config/runlet/env`, or `%APPDATA%\runlet\env` on Windows.
-3. Restart the runner: `systemctl --user restart runlet`, `launchctl kickstart -k "gui/$(id -u)/org.runlet.runner"`, or on Windows `Stop-ScheduledTask runlet; Start-ScheduledTask runlet`.
-4. Watch one command run end to end, then delete the old token in the Cloudflare dashboard.
+1. Delete the `RUNLET_RUNNER_TOKEN=` line from `~/.config/runlet/env` (`%APPDATA%\runlet\env` on Windows).
+2. Re-run the installer: it mints a new one and sets it as the Worker's secret.
+3. Watch one command run end to end.
 
-Rotate in that order. Deleting the old token first stops the runner mid-poll.
+The old token stops working the moment the Worker's secret is replaced, so the runner is briefly refused (a 404) until the new config is read.
 
 ## Find a lost connector URL
 

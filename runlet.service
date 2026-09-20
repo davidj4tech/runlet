@@ -7,7 +7,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=__LITE_DIR__/runlet.sh
+# KillMode=control-group (the default) takes the jobs with it, and the runner
+# also kills them itself on SIGTERM, which is what launchd needs.
+ExecStart=__NODE_BIN__/node __LITE_DIR__/runlet.mjs
 EnvironmentFile=-%h/.config/runlet/env
 Environment=PATH=__LITE_DIR__/worker/node_modules/.bin:__NODE_BIN__:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always

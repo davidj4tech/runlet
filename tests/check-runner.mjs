@@ -1,14 +1,16 @@
 #!/usr/bin/env node
-// check-windows.mjs — the Node runner (win/runlet.mjs) against a mock D1.
+// check-runner.mjs — runlet.mjs, the runner on every platform, driven against
+// the real Worker over real SQLite.
 //
-//     node tests/check-windows.mjs            every case
-//     node tests/check-windows.mjs <name>     one case, in this process
+//     node tests/check-runner.mjs            every case
+//     node tests/check-runner.mjs <name>     one case, in this process
 //
-// win/runlet.mjs reads its config once at module load, so each case runs in
+// runlet.mjs reads its config once at module load, so each case runs in
 // its own process. Cases marked `loop:` start the polling loop rather than
 // --once, and assert while it runs; the rest use --once and assert after.
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -22,7 +24,7 @@ const worker = (await import('../worker/src/index.ts')).default;
 const RUNNER_TOKEN = 'runner-token-under-test';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const RUNNER = path.join(HERE, '..', 'win', 'runlet.mjs');
+const RUNNER = path.join(HERE, '..', 'runlet.mjs');
 const KEY = 'ab'.repeat(32);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const WIN = process.platform === 'win32';
@@ -105,6 +107,71 @@ const until = async (pred, ms = 15000) => {
   return false;
 };
 const logged = (re) => logs.some((l) => re.test(l));
+
+// A real HTTP server in front of the real Worker, so a case can run the
+// runner as an actual child process: signals, process groups and shutdown
+// only mean anything outside this process. This is what lib/macos-job.py and
+// check-platform.py's ProcessTests used to cover.
+async function serveWorker(rows) {
+  const db = fakeD1(rows);
+  const env = {
+    DB: db.binding, RUNLET_HMAC_KEY: KEY,
+    RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+  };
+  const server = createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const r = await worker.fetch(new Request(`http://localhost${req.url}`, {
+      method: req.method, headers: req.headers, body: chunks.length ? Buffer.concat(chunks) : undefined,
+    }), env);
+    res.writeHead(r.status, { 'content-type': 'application/json' });
+    res.end(Buffer.from(await r.arrayBuffer()));
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `http://127.0.0.1:${server.address().port}`;
+  process.on('exit', () => server.close());
+  return { db, url, stop: () => server.close() };
+}
+
+// Spawn the runner the way a service manager does: its own process, its own
+// session, reading the same env file.
+function spawnRunner(url, conf, extra = {}) {
+  const child = spawn(process.execPath, [RUNNER], {
+    env: {
+      ...process.env, RUNLET_CONF: conf, RUNLET_WORKER_URL: url,
+      RUNLET_RUNNER_TOKEN: RUNNER_TOKEN, RUNLET_RUNNER_ID: 'testrunner',
+      XDG_STATE_HOME: path.join(TMP, 'state'), RUNLET_POLL: '1',
+      RUNLET_DETACH_CHECK: '1', RUNLET_CMD_TIMEOUT: '120', ...extra,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  // Keep the child's own log; a case that fails because the runner never
+  // started should say why rather than just time out.
+  child.err = '';
+  child.stderr.on('data', (d) => { child.err += d; });
+  child.stdout.on('data', (d) => { child.err += d; });
+  return child;
+}
+
+// A job whose GRANDCHILD keeps writing, and ignores TERM. If only the direct
+// child is killed the file keeps growing, which is the bug being tested for.
+const grandchildJob = (marker) =>
+  `( trap "" TERM; while true; do echo x >> '${marker}'; sleep 0.2; done ) & sleep 60`;
+
+const sizeOf = (f) => { try { return statSync(f).size; } catch { return 0; } };
+
+// The forced kill lands after the grace period (5s for a cancel, as
+// runlet.sh's cancel_job used), so wait for the writing to stop rather than
+// assume how long it takes.
+async function stopsGrowing(file, ms = 14000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const before = sizeOf(file);
+    await sleep(700);
+    if (sizeOf(file) === before) return true;
+  }
+  return false;
+}
 
 // --- cases -------------------------------------------------------------------
 const cases = {
@@ -291,7 +358,60 @@ const cases = {
     assert.match(db.row(1).output ?? '', /runner restarted/);
   },
 
-  // `status [n]`: the last rows, newest first, as runlet.sh prints them.
+  // Cancelling must reach everything the command started, not just the shell
+  // it started. POSIX only: the job runs in its own session and is killed by
+  // process group, where Windows uses taskkill /T (covered by loopCancel).
+  async posixCancelKillsDescendants() {
+    if (WIN) { console.log('  (skipped on Windows: taskkill /T is covered by loopCancel)'); return; }
+    const { conf } = setup();
+    const marker = path.join(TMP, 'grandchild');
+    const { db, url } = await serveWorker([job(grandchildJob(marker))]);
+    const runner = spawnRunner(url, conf);
+    try {
+      assert.ok(await until(() => sizeOf(marker) > 0), `the grandchild never started\n${runner.err}`);
+      assert.ok(await until(() => db.row(1).status === 'running'), 'the row never went running');
+      db.set(1, 'cancel', 1);
+      assert.ok(await until(() => db.row(1).status === 'cancelled'), 'never cancelled');
+      assert.ok(await stopsGrowing(marker), 'the grandchild outlived the cancel');
+    } finally { runner.kill('SIGKILL'); }
+  },
+
+  // Stopping the service must take the jobs with it. systemd kills the whole
+  // cgroup, but launchd kills only its own group and a job is in a session of
+  // its own, so the runner kills them itself on SIGTERM.
+  async posixShutdownKillsJobs() {
+    if (WIN) { console.log('  (skipped on Windows: no SIGTERM to a Scheduled Task)'); return; }
+    const { conf } = setup();
+    const marker = path.join(TMP, 'grandchild2');
+    const { db, url } = await serveWorker([job(grandchildJob(marker))]);
+    const runner = spawnRunner(url, conf);
+    try {
+      assert.ok(await until(() => sizeOf(marker) > 0), `the grandchild never started\n${runner.err}`);
+      assert.ok(await until(() => db.row(1).status === 'running'), 'the row never went running');
+      runner.kill('SIGTERM');
+      assert.ok(await until(() => runner.exitCode !== null || runner.signalCode !== null),
+        'the runner ignored SIGTERM');
+      assert.ok(await stopsGrowing(marker), 'a job outlived the runner that started it');
+    } finally { runner.kill('SIGKILL'); }
+  },
+
+  // The runner token is a bearer credential on every request, so a plaintext
+  // Worker URL would hand it to anyone on the path. Loopback is the exception.
+  async refusesPlaintextWorkerUrl() {
+    setup();
+    process.env.RUNLET_WORKER_URL = 'http://runlet.example.com';
+    await assert.rejects(() => import(pathToFileURL(RUNNER).href), /must be https/);
+  },
+
+  // `runlet --help` is what an assistant reads to learn the machine's surface.
+  async helpListsTheSubcommands() {
+    const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8' });
+    for (const expected of ['runlet skills', 'runlet status', 'RUNLET_WORKER_URL']) {
+      assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    }
+  },
+
+  // `status [n]`: the last rows, newest first, as the bash runner printed them.
   async statusListing() {
     setup();
     const db = fakeD1([
@@ -372,6 +492,6 @@ if (name) {
     if (r.code === 0) console.log(`  ok    ${c} (${secs}s)`);
     else { failed++; console.log(`  FAIL  ${c} (${secs}s)\n${r.err.replace(/^/gm, '        ')}`); }
   }
-  console.log(failed ? `check-windows: ${failed} case(s) failed` : `check-windows: ${Object.keys(all).length} cases, all pass`);
+  console.log(failed ? `check-runner: ${failed} case(s) failed` : `check-runner: ${Object.keys(all).length} cases, all pass`);
   process.exit(failed ? 1 : 0);
 }

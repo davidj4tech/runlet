@@ -255,13 +255,19 @@ function Register-RunletTask {
   }
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force | Out-Null
-  # Only start it if it is not already running. MultipleInstances IgnoreNew
-  # refuses a second start, and the refusal is recorded as the task's
-  # LastTaskResult (0x800710E0, "the operator or administrator has refused the
-  # request") -- which is the field SETUP.md tells people to check.
-  if ((Get-ScheduledTask -TaskName $TaskName).State -ne 'Running') {
-    Start-ScheduledTask -TaskName $TaskName
+  # Restart rather than start. A running instance keeps executing the command
+  # it was registered with, so a re-run that changed it would leave the old
+  # runner going. Stop first, because MultipleInstances IgnoreNew refuses a
+  # second start and records the refusal as LastTaskResult (0x800710E0) --
+  # the field SETUP.md tells people to check.
+  if ((Get-ScheduledTask -TaskName $TaskName).State -eq 'Running') {
+    Stop-ScheduledTask -TaskName $TaskName
+    foreach ($i in 1..20) {
+      if ((Get-ScheduledTask -TaskName $TaskName).State -ne 'Running') { break }
+      Start-Sleep -Milliseconds 250
+    }
   }
+  Start-ScheduledTask -TaskName $TaskName
   Get-ScheduledTask -TaskName $TaskName
 }
 

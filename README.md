@@ -7,7 +7,7 @@ Runlet is deliberately small. A remote MCP client queues a signed command throug
 ```text
 assistant  ──MCP──▶  Cloudflare Worker  ──▶  signed row in D1
                                                    ▲
-your machine ◀──────── runlet.sh polls, verifies, runs, returns output
+your machine ◀──────── runlet.mjs polls, verifies, runs, returns output
 ```
 
 The local machine only makes outbound HTTPS requests. It needs no public IP, open port, VPN, or inbound firewall rule.
@@ -65,7 +65,7 @@ Each entry is a Markdown file, a symlink to one, or a directory containing a `SK
 
 1. The MCP client calls the Worker through a secret URL.
 2. The Worker creates a nonce, signs `nonce + "\n" + command` with HMAC-SHA256, and writes the command to D1.
-3. `runlet.sh` polls D1 over Cloudflare's HTTP API.
+3. `runlet.mjs` polls its Worker over HTTPS, with a per-machine bearer token; the Worker is the only thing that touches D1.
 4. The runner verifies the signature and rejects reused nonces.
 5. The runner atomically claims the row, then executes the command locally.
 6. Output, exit status, runner identity, and final state are written back to D1.
@@ -84,7 +84,7 @@ The short version for an existing Cloudflare user:
    - **D1: Edit**
    - **Account Settings: Read**
 
-   The installer needs all three, once. The runner it leaves behind uses only **D1: Edit** — see [Use a separate token per machine](SETUP.md#use-a-separate-token-per-machine) for why each machine should keep a narrower token of its own.
+   The installer needs all three, once. It no longer leaves a Cloudflare token on the machine at all: the runner reaches its queue through its own Worker with a per-machine bearer token. See [Use a separate token per machine](SETUP.md#use-a-separate-token-per-machine) for the background.
 2. Run the installer:
 
    ```bash
@@ -96,7 +96,7 @@ The short version for an existing Cloudflare user:
    On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is `win\runlet.mjs` (Node), started by a Scheduled Task at logon.
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
-The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows).
+The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows). The runner is the same `runlet.mjs` on all three.
 
 Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them.
 
@@ -190,8 +190,8 @@ The Worker also supports `RUNLET_WAIT_DEFAULT` and `RUNLET_WAIT_MAX`; waits are 
 Check recent commands:
 
 ```bash
-runlet.sh status
-runlet.sh status 30
+runlet status
+runlet status 30
 ```
 
 Follow the runner log:
@@ -227,11 +227,12 @@ Run it after changing signing code on either side. Portability checks exercise i
 python3 tests/check-platform.py
 ```
 
-The Windows runner is a separate implementation, so it gets its own suite: `win/runlet.mjs` driven against a mock D1, covering execution, timeout, cancel, detach, signature rejection, replay rejection, the serial lane, and env-file reloading. `check-platform.py` runs it too; run it alone while working on the Node runner:
+The runner is driven against the real Worker over real SQLite, so both sides are tested against each other: execution, timeout, cancel, detach, signature and replay rejection, the serial lane, env-file reloading, and — as real child processes — that a cancel and a shutdown both reach everything a command started. `check-platform.py` runs it too; run it alone while working on the runner:
 
 ```bash
-node tests/check-windows.mjs            # every case
-node tests/check-windows.mjs basic      # one case
+node --experimental-strip-types --experimental-sqlite tests/check-runner.mjs        # every case
+node --experimental-strip-types --experimental-sqlite tests/check-runner.mjs basic  # one case
+node --experimental-strip-types --experimental-sqlite tests/check-worker.mjs        # the Worker's runner API
 ```
 
 The installer's own helpers — site names, the env file, secrets, the Scheduled Task definition — are checked separately, because none of them can run anywhere but Windows:
@@ -254,18 +255,15 @@ Those omissions are part of the design. If you need richer client identity, sess
 |---|---|
 | `worker/src/index.ts` | Remote MCP Worker: four tools, signing, queueing, and result retrieval. |
 | `schema.sql` | D1 schema: one command table and its pending-row index. |
-| `runlet.sh` | Local runner: poll, verify, claim, execute, monitor, and report. |
-| `runlet.service` | systemd user-service template. |
+| `runlet.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
 | `install.sh` | Linux/macOS installer and Cloudflare provisioning. |
-| `lib/platform.sh` | macOS dependency paths, process launcher, and load average. |
-| `lib/macos-job.py` | macOS job sessions and cleanup when launchd stops the service. |
-| `win/runlet.mjs` | Windows runner in Node: the same protocol and signing, native process handling. |
+| `runlet.service` | systemd user-service template. |
 | `install.ps1` | Windows installer: provisioning, config, and the Scheduled Task. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |
 | `tests/check-signing.sh` | Cross-implementation signing compatibility test. |
 | `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
-| `tests/check-windows.mjs` | The Node runner against `tests/mock-d1.mjs`, a stand-in for the D1 HTTP API. |
+| `tests/check-runner.mjs` | The runner driven against the real Worker over real SQLite. |
 | `tests/check-windows-install.ps1` | `install.ps1`'s helpers, with no Cloudflare access and nothing installed. |
 | `tests/check-worker.mjs` | The Worker's runner API, executed against real SQLite via `tests/fake-d1.mjs`. |
 

@@ -1,22 +1,20 @@
 #!/usr/bin/env node
-// runlet.mjs — the Windows runner. Same wire protocol, same v1 signature
-// scheme and same D1 schema as runlet.sh; only the OS plumbing differs.
+// runlet.mjs — the runner, on every platform. It polls its Worker for signed
+// commands, runs what verifies, and writes the results back.
 //
 //   THIS PROCESS EXECUTES COMMANDS READ FROM A DATABASE, as you.
 //   The HMAC check below is what stops a row that merely got INTO the
 //   database from running: only a row signed with relay.key is executed.
 //
 // Usage:  node runlet.mjs            poll forever (the service form)
+//         node runlet.mjs --help     the above, for a person or an assistant
 //         node runlet.mjs --once     one poll, for testing
 //         node runlet.mjs status [n] the last n rows (default 10), newest first
 //         node runlet.mjs skills     the skills listed in RUNLET_SKILLS_DIR
 //         node runlet.mjs sign <nonce> <command>
 //
-// Every tunable runlet.sh re-reads each poll is re-read here too, from the
-// same env file, so editing it is live within one interval on both runners.
-//
-// Verified on Windows (Node 22.20.0, PowerShell 5.1) by tests/check-windows.mjs,
-// which runs on either platform.
+// Every tunable is re-read from the env file each poll, so editing it is live
+// within one interval and needs no restart.
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
@@ -129,6 +127,36 @@ function ctEqual(a, b) {
 // --- subcommands that need no database --------------------------------------
 const [sub, ...rest] = process.argv.slice(2);
 
+if (sub === '--help' || sub === '-h' || sub === 'help') {
+  console.log(`runlet: run signed shell commands queued by an assistant, on this machine.
+
+  runlet skills        the tools the owner has set up here, and where to read about each
+  runlet status [n]    the last n rows (default 10), newest first
+  runlet --once        one poll, then exit
+  runlet               poll forever (what the service runs)
+  runlet sign <nonce> <command>   the signature this runner expects
+
+Config: ${ENV_FILE}
+  RUNLET_WORKER_URL     this machine's Worker
+  RUNLET_RUNNER_TOKEN   its bearer token (no Cloudflare credential lives here)
+  RUNLET_KEY_FILE       hex key shared with the Worker (default relay.key beside env)
+  RUNLET_POLL           seconds between polls (default 5)
+  RUNLET_CMD_TIMEOUT    seconds a command may run (default 600)
+  RUNLET_MAX_OUTPUT     bytes of output kept (default 60000)
+  RUNLET_PARALLEL       commands run at once (default 1: strictly in order)
+  RUNLET_BACKGROUND_MAX rows sent with background=true running at once (default 4)
+  RUNLET_DETACH_CHECK   seconds between looks for a detach or cancel (default 3)
+  RUNLET_KEEP_DAYS      finished rows older than this are deleted daily (default 30)
+  RUNLET_PROGRESS_EVERY seconds between progress copies (default 10; 0 = off)
+  RUNLET_LOAD_MAX       hold new commands above this 1-minute load average (0 = off)
+  RUNLET_RUNNER_ID      this runner's name on the rows it claims (default: hostname)
+  RUNLET_SKILLS_DIR     SKILL.md files that \`skills\` lists (default skills/ beside env)
+
+Every tunable above is re-read each poll: edit the file and it is live within
+one interval.`);
+  process.exit(0);
+}
+
 if (sub === 'sign') {
   // rest[1] whole, never rest.slice(1).join(' '): a command's own runs of
   // spaces are part of the signed text, and argv has already split nothing.
@@ -176,9 +204,23 @@ if (sub === 'skills') {
   process.exit(0);
 }
 
-if (!/^https:\/\//.test(WORKER_URL) || !RUNNER_TOKEN) {
-  throw new Error('runlet: set RUNLET_WORKER_URL and RUNLET_RUNNER_TOKEN in '
-    + `${ENV_FILE} — re-run install.ps1 if this machine predates them`);
+// The runner token goes on every request, so the Worker URL must be https --
+// over plaintext to anything but this machine it would be handed to whoever
+// is listening. Loopback is allowed because the tests serve the real Worker
+// there, and a request that never leaves the machine has nothing to sniff.
+function checkWorkerUrl(raw) {
+  let u;
+  try { u = new URL(raw); } catch { return 'is not a URL'; }
+  if (u.protocol === 'https:') return null;
+  const loopback = u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '::1';
+  if (u.protocol === 'http:' && loopback) return null;
+  return 'must be https (http is allowed only on loopback)';
+}
+const urlProblem = WORKER_URL ? checkWorkerUrl(WORKER_URL) : 'is not set';
+if (urlProblem || !RUNNER_TOKEN) {
+  throw new Error(`runlet: RUNLET_WORKER_URL ${urlProblem ?? 'is set'}`
+    + `${RUNNER_TOKEN ? '' : ' and RUNLET_RUNNER_TOKEN is not set'} in ${ENV_FILE}`
+    + ' — re-run the installer if this machine predates them');
 }
 
 // `status [n]`: the last rows, newest first -- "is it stuck?" as one command.
@@ -255,6 +297,16 @@ function killTree(pid, force) {
   try { process.kill(-pid, sig); } catch { try { process.kill(pid, sig); } catch {} }
   return true;
 }
+// Is anything left in the job's process group? Not "is the direct child
+// alive": a shell that does not trap TERM dies at once while a descendant
+// that does traps it survives, and waiting on the child alone would skip the
+// forced kill and leave that descendant running. This is the group probe
+// runlet.sh made with `kill -0 -- -$pgid`.
+function groupAlive(pid) {
+  if (WIN) return false;           // taskkill /T walks the tree in one go
+  try { process.kill(-pid, 0); return true; } catch { return false; }
+}
+
 // TERM first, KILL after a grace period, like `timeout --kill-after=10` and
 // cancel_job: a job that traps TERM still gets to clean up before it goes.
 // Windows refuses the polite form for a console process outright ("can only
@@ -263,10 +315,30 @@ function killTree(pid, force) {
 async function killTreeGracefully(pid, graceMs, alive) {
   if (!killTree(pid, false)) { killTree(pid, true); return; }
   for (let i = 0; i < Math.ceil(graceMs / 1000); i++) {
-    if (!alive()) return;
+    if (!alive() && !groupAlive(pid)) return;
     await sleep(1000);
   }
   killTree(pid, true);
+}
+
+// Every job this runner started, so a shutdown can take them with it.
+// systemd kills the whole cgroup on stop, but launchd kills only its own
+// process group, and a job runs in a session of its own (detached), so it
+// would survive -- which is what lib/macos-job.py existed to prevent. Doing
+// it here covers launchd, Task Scheduler and a plain Ctrl-C alike.
+const live = new Map();          // job id -> pid
+
+let shuttingDown = false;
+for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
+  try {
+    process.on(sig, () => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      if (live.size) log(`${sig}: stopping ${live.size} running job(s)`);
+      for (const pid of live.values()) killTree(pid, true);
+      process.exit(sig === 'SIGINT' ? 130 : 143);
+    });
+  } catch { /* not every signal exists on every platform */ }
 }
 
 // Returns { lane, done }. `lane` settles when the queue may move on — the job
@@ -283,6 +355,7 @@ function executeAndWatch(id, command) {
       detached: !WIN, windowsHide: true, stdio: ['ignore', fd, fd],
     });
   } finally { closeSync(fd); }
+  live.set(id, child.pid);
 
   let running = true, cancelled = false, timedOut = false, detached = false;
   const started = Date.now();
@@ -326,7 +399,7 @@ function executeAndWatch(id, command) {
   }, DETACH_CHECK);
 
   const done = exited.then(async (code) => {
-    clearTimeout(timer); clearInterval(watcher);
+    clearTimeout(timer); clearInterval(watcher); live.delete(id);
     const out = head(outFile);
     try { unlinkSync(outFile); } catch {}
     if (cancelled) {
@@ -488,7 +561,7 @@ if (sub === '--once') {
   await Promise.all([...inFlight]);      // `runlet.sh --once` ends with `wait`
   log(`polled, ${n} row(s)`);
 } else {
-  log(`runlet windows runner starting as ${RUNNER_ID}, polling every ${T.POLL}s`
+  log(`runlet runner starting as ${RUNNER_ID}, polling every ${T.POLL}s`
     + ` with a ${T.CMD_TIMEOUT}s limit per command`
     + (T.PARALLEL > 1 ? `, up to ${T.PARALLEL} at once` : ''));
   await sweepOrphans();

@@ -93,6 +93,8 @@ case "$OS" in
     fi
     command -v brew >/dev/null 2>&1 || die "macOS requires Homebrew. Install it from https://brew.sh, then re-run ./install.sh"
     RUNLET_BREW_PREFIX=$(brew --prefix)
+    # python for the LaunchAgent plist this script writes; jq/openssl/coreutils
+    # for provisioning here. The runner itself needs only node.
     brew install jq coreutils openssl@3 python
     export PATH="$RUNLET_BREW_PREFIX/opt/coreutils/libexec/gnubin:$RUNLET_BREW_PREFIX/opt/openssl@3/bin:$RUNLET_BREW_PREFIX/bin:$PATH"
     ;;
@@ -102,8 +104,9 @@ esac
 need_apt=()
 if [[ "$OS" == Linux ]]; then
   for d in curl jq openssl; do command -v "$d" >/dev/null 2>&1 || need_apt+=("$d"); done
-  if ! command -v timeout >/dev/null 2>&1 || ! command -v shuf >/dev/null 2>&1; then need_apt+=(coreutils); fi
-  command -v setsid >/dev/null 2>&1 || need_apt+=(util-linux)
+  # shuf, for the word secret. setsid and timeout were the bash runner's;
+  # runlet.mjs makes its own sessions and enforces its own timeout.
+  command -v shuf >/dev/null 2>&1 || need_apt+=(coreutils)
 fi
 if [[ -n "${need_apt[*]:-}" ]]; then
   command -v apt-get >/dev/null 2>&1 || die "install the missing packages with your package manager: ${need_apt[*]}"
@@ -220,9 +223,18 @@ else
     URL_SECRET=$(openssl rand -hex 24); note "generated the URL secret (hex; words.txt not found)"
   fi
 fi
+# The runner's own credential: a bearer token for this machine's Worker. The
+# machine that executes commands holds no Cloudflare token, because a D1 one
+# is account-wide and would reach every other machine's queue.
+if [[ -r "$CONF/env" ]] && RUNNER_TOKEN=$(sed -n 's/^RUNLET_RUNNER_TOKEN=//p' "$CONF/env" | tail -1) && [[ -n "$RUNNER_TOKEN" ]]; then
+  note "runner token exists, keeping it"
+else
+  RUNNER_TOKEN=$(openssl rand -hex 32); note "generated the runner token"
+fi
 ( cd "$HERE/worker" \
   && tr -d '[:space:]' < "$CONF/relay.key" | "$WRANGLER" secret put RUNLET_HMAC_KEY >/dev/null \
-  && printf '%s' "$URL_SECRET" | "$WRANGLER" secret put RUNLET_URL_SECRET >/dev/null ) || die "setting Worker secrets failed"
+  && printf '%s' "$URL_SECRET" | "$WRANGLER" secret put RUNLET_URL_SECRET >/dev/null \
+  && printf '%s' "$RUNNER_TOKEN" | "$WRANGLER" secret put RUNLET_RUNNER_TOKEN >/dev/null ) || die "setting Worker secrets failed"
 note "Worker secrets set"
 
 # --- 6. workers.dev subdomain, then deploy ----------------------------------
@@ -239,10 +251,13 @@ WORKER_URL="https://$WORKER_NAME.$sub.workers.dev"
 
 # --- 7. local config ---------------------------------------------------------
 say "Writing $CONF/env"
+# CLOUDFLARE_API_TOKEN is deliberately NOT written here. The runner reaches
+# its queue through the Worker, and a D1 API token is account-wide: one left
+# on every machine would reach every other machine's queue. Provisioning needs
+# it, this machine does not, so a re-run asks for it again.
 cat > "$CONF/env" <<EOF
-# runlet — written by install.sh $(date +%F). The token here is what the
-# runner uses to read and write the queue; keep this file private.
-CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN
+# runlet — written by install.sh $(date +%F). The runner token here is this
+# machine's credential for its own Worker; keep this file private.
 CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID
 RUNLET_SITE=$RUNLET_SITE
 RUNLET_WORKER_NAME=$WORKER_NAME
@@ -250,6 +265,7 @@ RUNLET_DB_NAME=$DB_NAME
 RUNLET_DB_ID=$DB_ID
 RUNLET_URL_SECRET=$URL_SECRET
 RUNLET_WORKER_URL=$WORKER_URL
+RUNLET_RUNNER_TOKEN=$RUNNER_TOKEN
 RUNLET_POLL=5
 RUNLET_CMD_TIMEOUT=600
 EOF
@@ -259,11 +275,15 @@ if [[ "$OS" == Darwin ]]; then
   printf 'RUNLET_BREW_PREFIX=%q\n' "$RUNLET_BREW_PREFIX" >> "$CONF/env"
 fi
 chmod 600 "$CONF/env"
-chmod +x "$HERE/runlet.sh"
 # `runlet` on PATH, so `runlet --help` is there to find: ~/.local/bin is on
-# the login-shell PATH of most distros, and commands run under bash -lc.
+# the login-shell PATH of most distros, and commands run under bash -lc. A
+# two-line shim rather than a symlink, because the runner is run BY node.
 mkdir -p "$HOME/.local/bin" "$CONF/skills"
-ln -sfn "$HERE/runlet.sh" "$HOME/.local/bin/runlet"
+cat > "$HOME/.local/bin/runlet" <<EOF
+#!/bin/sh
+exec "$NODE_BIN/node" "$HERE/runlet.mjs" "\$@"
+EOF
+chmod +x "$HOME/.local/bin/runlet"
 
 # --- 8. smoke test: queue a row the way the Worker does, run it once ---------
 say "Smoke test"
@@ -278,7 +298,7 @@ done
 [[ -n "$resp" ]] || die "the Worker did not answer at $WORKER_URL/<secret>/mcp after a minute"
 rid=$(jq -r '.result.content[0].text' <<<"$resp" | grep -oE '^#[0-9]+' | tr -d '#')
 [[ -n "$rid" ]] || die "unexpected Worker reply: $resp"
-"$HERE/runlet.sh" --once 2>&1 | sed 's/^/    /'
+"$NODE_BIN/node" "$HERE/runlet.mjs" --once 2>&1 | sed 's/^/    /'
 # get_result with a wait: if a service is already running it may have taken
 # the row before the one-shot poll above, and still be on it.
 got=$(curl -fsS -X POST "$WORKER_URL/$URL_SECRET/mcp" -H 'Content-Type: application/json' \
@@ -289,7 +309,7 @@ note "queued #$rid, ran it, read the output back: OK"
 
 # --- 9. the service ----------------------------------------------------------
 if (( NO_SERVICE )); then
-  say "Not starting the service (--no-service). Run it with: $HERE/runlet.sh"
+  say "Not starting the service (--no-service). Run it with: $NODE_BIN/node $HERE/runlet.mjs"
 elif [[ "$OS" == Darwin ]]; then
   say "Starting the runner as a macOS LaunchAgent"
   AGENT_LABEL=org.runlet.runner
@@ -297,14 +317,14 @@ elif [[ "$OS" == Darwin ]]; then
   LOG_DIR="$HOME/Library/Logs/runlet"
   mkdir -p "$(dirname "$AGENT_PLIST")" "$LOG_DIR"
   # plistlib escapes XML metacharacters and spaces in paths correctly.
-  python3 - "$AGENT_PLIST" "$HERE" "$HOME" "$PATH" "$LOG_DIR" <<'PYPLIST'
+  python3 - "$AGENT_PLIST" "$HERE" "$HOME" "$PATH" "$LOG_DIR" "$NODE_BIN/node" <<'PYPLIST'
 import plistlib
 import sys
-plist, repo, home, path, logs = sys.argv[1:]
+plist, repo, home, path, logs, node = sys.argv[1:]
 with open(plist, "wb") as stream:
     plistlib.dump({
         "Label": "org.runlet.runner",
-        "ProgramArguments": ["/bin/bash", repo + "/runlet.sh"],
+        "ProgramArguments": [node, repo + "/runlet.mjs"],
         "WorkingDirectory": home,
         "EnvironmentVariables": {"HOME": home, "PATH": home + "/.local/bin:" + path},
         "RunAtLoad": True,
@@ -326,7 +346,7 @@ PYPLIST
     note "$AGENT_LABEL installed; starts now and at login"
   else
     note "LaunchAgent installed; it will start at your next desktop login."
-    note "To run now in this session: $HERE/runlet.sh"
+    note "To run now in this session: $NODE_BIN/node $HERE/runlet.mjs"
   fi
 else
   say "Starting the runner as a systemd user service"
@@ -335,16 +355,20 @@ else
       note "systemd is not running in this WSL distro. Enabling it in /etc/wsl.conf."
       printf '[boot]\nsystemd=true\n' | sudo tee -a /etc/wsl.conf >/dev/null
       note "From PowerShell run:  wsl --shutdown   then open the distro again and re-run ./install.sh"
-      note "Until then, run the runner by hand: $HERE/runlet.sh"
+      note "Until then, run the runner by hand: $NODE_BIN/node $HERE/runlet.mjs"
     else
-      note "systemd user session not available; run the runner by hand: $HERE/runlet.sh"
+      note "systemd user session not available; run the runner by hand: $NODE_BIN/node $HERE/runlet.mjs"
     fi
   else
     mkdir -p "$HOME/.config/systemd/user"
     sed -e "s|__LITE_DIR__|$HERE|g" -e "s|__NODE_BIN__|$NODE_BIN|g" "$HERE/runlet.service" \
       > "$HOME/.config/systemd/user/runlet.service"
     systemctl --user daemon-reload
-    systemctl --user enable --now runlet >/dev/null
+    systemctl --user enable runlet >/dev/null
+    # restart, not `enable --now`: --now only STARTS a stopped unit, so a
+    # re-run that changed ExecStart would leave the old runner running and
+    # two of them competing for the same queue.
+    systemctl --user restart runlet
     sudo loginctl enable-linger "$USER" 2>/dev/null || true
     sleep 2
     note "runlet.service: $(systemctl --user is-active runlet)"
@@ -397,7 +421,7 @@ cat <<EOF
 
     Status:      runlet status        (runlet --help for the rest)
     Skills:      link SKILL.md files into $CONF/skills/ for assistants to find
-    Config:      $CONF/env   (token, secret, URL)   $CONF/relay.key
+    Config:      $CONF/env   (runner token, URL secret)   $CONF/relay.key
     Re-run this script any time; it keeps existing keys and ids.
 EOF
 if [[ "$OS" == Darwin ]]; then

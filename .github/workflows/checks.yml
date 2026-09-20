@@ -22,19 +22,20 @@ jobs:
       - name: Shell syntax (system Bash)
         run: |
           /bin/bash -n install.sh
-          /bin/bash -n runlet.sh
-          /bin/bash -n lib/platform.sh
+          /bin/bash -n tests/check-signing.sh
       - name: Signing compatibility
         run: /bin/bash tests/check-signing.sh
       - name: Installer and process behavior
         run: python3 tests/check-platform.py
       - name: Worker runner API
         run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-worker.mjs
+      - name: Runner behavior
+        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-runner.mjs
 
-  # The Node runner is a separate implementation with its own OS plumbing --
-  # taskkill, powershell.exe, %LOCALAPPDATA% -- that no POSIX runner reaches.
-  # A detached-spawn bug made every Windows job report success having run
-  # nothing, and only a real Windows run could see it.
+  # The same runner, on the platform whose OS plumbing -- taskkill,
+  # powershell.exe, %LOCALAPPDATA% -- no POSIX run reaches. A detached-spawn
+  # bug made every Windows job report success having run nothing, and only a
+  # real Windows run could see it.
   windows-runner:
     runs-on: windows-latest
     steps:
@@ -42,8 +43,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Windows runner behavior
-        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-windows.mjs
+      - name: Runner behavior on Windows
+        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-runner.mjs
       - name: Windows installer helpers
         # Windows PowerShell 5.1, which is what ships on the machine, not pwsh 7.
         shell: powershell

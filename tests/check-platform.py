@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""No cloud access: mock provisioning, exercise real process supervision."""
+"""No cloud access: mock provisioning and check how install.sh routes it."""
 
 import os
 from pathlib import Path
 import plistlib
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -38,7 +37,7 @@ class InstallerTests(unittest.TestCase):
             shutil.copy(ROOT / name, dest)
         # Exercise the word-secret path too, without copying the real wordlist.
         (self.repo / "words.txt").write_text("\n".join(f"word{i}" for i in range(1300)) + "\n")
-        write_executable(self.repo / "runlet.sh", "#!/bin/bash\necho runlet-ok\n")
+        (self.repo / "runlet.mjs").write_text("console.log('runlet-ok')\n")
         self.log = self.base / "calls"
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + ":" + os.environ["PATH"],
                         RUNLET_TEST_LOG=str(self.log), RUNLET_TEST_PREFIX=str(self.prefix),
@@ -92,7 +91,9 @@ esac
         plist = self.home / "Library/LaunchAgents/org.runlet.runner.plist"
         with plist.open("rb") as stream:
             agent = plistlib.load(stream)
-        self.assertEqual(agent["ProgramArguments"], ["/bin/bash", str((self.repo / "runlet.sh").resolve())])
+        # The runner is node now, not bash; the LaunchAgent must say so.
+        self.assertEqual(agent["ProgramArguments"][1], str((self.repo / "runlet.mjs").resolve()))
+        self.assertTrue(agent["ProgramArguments"][0].endswith("node"), agent["ProgramArguments"][0])
         self.assertEqual(agent["EnvironmentVariables"]["HOME"], str(self.home))
         if sys.platform == "darwin":
             subprocess.run(["/usr/bin/plutil", "-lint", str(plist)], check=True, capture_output=True)
@@ -145,84 +146,6 @@ esac
         self.assertNotIn("brew install", calls)
 
 
-class ProcessTests(unittest.TestCase):
-    def start(self, script, *args):
-        return subprocess.Popen([sys.executable, str(ROOT / "lib/macos-job.py"),
-                                 "bash", "-c", script, "_", *map(str, args)],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    def test_output_and_exit_code(self):
-        job = self.start('printf "hello\\n"; exit 7')
-        out, err = job.communicate(timeout=5)
-        self.assertEqual((job.returncode, out, err), (7, "hello\n", ""))
-
-    def test_timeout(self):
-        timeout = shutil.which("gtimeout") or shutil.which("timeout")
-        self.assertIsNotNone(timeout, "GNU coreutils is required")
-        job = self.start('exec "$1" --kill-after=1 0.2 bash -c "sleep 30"', timeout)
-        job.communicate(timeout=5)
-        self.assertEqual(job.returncode, 124)
-
-    def exercise_cleanup(self, cancel):
-        # A child that ignores TERM proves group cancellation/shutdown also
-        # reaches descendants. Kill the test process group on assertion failure.
-        job = self.start('echo $$; (trap "" TERM; echo child; exec sleep 30) & wait')
-        pgid = int(job.stdout.readline())
-        self.assertEqual(job.stdout.readline().strip(), "child")
-        try:
-            if cancel:
-                os.killpg(pgid, signal.SIGKILL)
-            else:
-                job.terminate()
-            job.communicate(timeout=5)
-            self.assertEqual(job.returncode, 137 if cancel else 143)
-            # A killed child may remain as a zombie briefly under container PID 1.
-            ps = subprocess.check_output(["ps", "-axo", "pgid=,stat="], text=True)
-            live = [line for line in ps.splitlines()
-                    if line.split()[0] == str(pgid) and not line.split()[1].startswith("Z")]
-            self.assertEqual(live, [])
-        finally:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            if job.poll() is None:
-                job.kill()
-                job.wait()
-
-    def test_cancel_kills_descendants(self):
-        self.exercise_cleanup(cancel=True)
-
-    def test_service_shutdown_kills_descendants(self):
-        self.exercise_cleanup(cancel=False)
-
-    def test_symlinked_runner_help(self):
-        with tempfile.TemporaryDirectory() as temp:
-            link = Path(temp) / "runlet"
-            link.symlink_to(ROOT / "runlet.sh")
-            result = subprocess.run(["/bin/bash", str(link), "--help"], text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("runlet skills", result.stdout)
-
-    def test_empty_skills_directory(self):
-        with tempfile.TemporaryDirectory() as temp:
-            env = dict(os.environ, RUNLET_CONF=temp, RUNLET_SKILLS_DIR=temp)
-            env.pop("RUNLET", None)
-            result = subprocess.run(["/bin/bash", str(ROOT / "runlet.sh"), "skills"],
-                                    env=env, text=True, capture_output=True)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("No skills listed", result.stdout)
-
-    def test_macos_load_average(self):
-        with tempfile.TemporaryDirectory() as temp:
-            write_executable(Path(temp) / "sysctl", '#!/bin/bash\necho "{ 1.25 2.50 3.75 }"\n')
-            env = dict(os.environ, PATH=temp + ":" + os.environ["PATH"])
-            script = '. "$1/lib/platform.sh"; RUNLET_OS=Darwin; runlet_load_average'
-            result = subprocess.check_output(["/bin/bash", "-c", script, "_", str(ROOT)],
-                                             env=env, text=True)
-            self.assertEqual(result.strip(), "1.25")
-
-
 class WorkerTests(unittest.TestCase):
     """The Worker's runner API against real SQLite -- see tests/check-worker.mjs."""
 
@@ -241,10 +164,10 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
-class WindowsRunnerTests(unittest.TestCase):
-    """win/runlet.mjs against a mock D1 -- see tests/check-windows.mjs."""
+class RunnerTests(unittest.TestCase):
+    """runlet.mjs against the real Worker -- see tests/check-runner.mjs."""
 
-    def test_windows_runner(self):
+    def test_runner(self):
         node = shutil.which("node")
         if node is None:
             # Non-interactive shells on fnm-managed hosts may not have the
@@ -253,10 +176,10 @@ class WindowsRunnerTests(unittest.TestCase):
             candidate = alias / "aliases/default/bin/node"
             node = str(candidate) if candidate.is_file() else None
         if node is None:
-            self.skipTest("Node is required for the Windows runner tests")
+            self.skipTest("Node is required for the runner tests")
         result = subprocess.run(
             [node, "--experimental-strip-types", "--experimental-sqlite", "--no-warnings",
-             str(ROOT / "tests/check-windows.mjs")],
+             str(ROOT / "tests/check-runner.mjs")],
             text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
