@@ -223,6 +223,24 @@ class ProcessTests(unittest.TestCase):
             self.assertEqual(result.strip(), "1.25")
 
 
+class WorkerTests(unittest.TestCase):
+    """The Worker's runner API against real SQLite -- see tests/check-worker.mjs."""
+
+    def test_runner_api(self):
+        node = shutil.which("node")
+        if node is None:
+            alias = Path(os.environ.get("FNM_DIR", Path.home() / ".local/share/fnm"))
+            candidate = alias / "aliases/default/bin/node"
+            node = str(candidate) if candidate.is_file() else None
+        if node is None:
+            self.skipTest("Node 22.6+ is required for the Worker tests")
+        result = subprocess.run(
+            [node, "--experimental-strip-types", "--experimental-sqlite", "--no-warnings",
+             str(ROOT / "tests/check-worker.mjs")],
+            text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
 class WindowsRunnerTests(unittest.TestCase):
     """win/runlet.mjs against a mock D1 -- see tests/check-windows.mjs."""
 

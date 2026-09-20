@@ -267,6 +267,7 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
 | `tests/check-windows.mjs` | The Node runner against `tests/mock-d1.mjs`, a stand-in for the D1 HTTP API. |
 | `tests/check-windows-install.ps1` | `install.ps1`'s helpers, with no Cloudflare access and nothing installed. |
+| `tests/check-worker.mjs` | The Worker's runner API, executed against real SQLite via `tests/fake-d1.mjs`. |
 
 ## License
 

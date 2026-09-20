@@ -31,6 +31,13 @@ interface Env {
   RUNLET_HMAC_KEY: string
   /** The path secret. Set with `wrangler secret put`. */
   RUNLET_URL_SECRET: string
+  /**
+   * Bearer token a runner presents at /runner. One per machine, so the
+   * machine that executes commands holds no Cloudflare credential at all --
+   * a D1 API token is account-wide, and would reach every other queue.
+   * Absent = the runner API is off, and every request to it is a 404.
+   */
+  RUNLET_RUNNER_TOKEN?: string
   /** Seconds run_command waits by default / at most. */
   RUNLET_WAIT_DEFAULT?: string
   RUNLET_WAIT_MAX?: string
@@ -203,6 +210,126 @@ async function awaitRow(env: Env, id: number, waitSeconds: number): Promise<{ ro
   }
 }
 
+// --- the runner API ---------------------------------------------------------
+// Everything a runner used to do with its own D1 credential, as one POST with
+// an `op`. Six ops, chosen so a poll costs one request and a watcher tick
+// costs one: `claim` returns rows already claimed, and `heartbeat` writes
+// progress and reads the cancel/background flags in the same round trip.
+//
+// The runner is not the assistant: it authenticates with a Bearer header
+// rather than a path secret, so its credential stays out of URLs and logs.
+const CLAIM_LIMIT = 5
+
+function runnerJson(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status, headers: { 'content-type': 'application/json' },
+  })
+}
+
+export async function runnerApi(request: Request, env: Env): Promise<Response> {
+  const offered = (request.headers.get('authorization') ?? '').replace(/^Bearer /, '')
+  // Same 404 as an unknown path: whether the API exists must not depend on
+  // whether the token was right.
+  if (!env.RUNLET_RUNNER_TOKEN || !timingSafeEqual(offered, env.RUNLET_RUNNER_TOKEN)) {
+    return new Response('not found', { status: 404 })
+  }
+  if (request.method !== 'POST') return new Response('POST JSON here', { status: 405 })
+
+  let body: any
+  try { body = await request.json() } catch { return runnerJson({ error: 'parse error' }, 400) }
+  const runner = String(body?.runner ?? '')
+  const id = Number(body?.id)
+
+  switch (body?.op) {
+    // Claim up to CLAIM_LIMIT pending rows and return them already claimed.
+    // The runner used to SELECT and then UPDATE, and two runners could race
+    // for the same row; doing both here makes the claim atomic by
+    // construction. `backgroundOnly` is the busy serial lane asking for the
+    // rows it can still start.
+    case 'claim': {
+      const where = body?.backgroundOnly ? "status = 'pending' AND background = 1" : "status = 'pending'"
+      const { results = [] } = await env.DB.prepare(
+        `UPDATE commands SET status = 'running', runner = ?, updated_at = datetime('now')
+         WHERE id IN (SELECT id FROM commands WHERE ${where} ORDER BY id LIMIT ?)
+         RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background`,
+      ).bind(runner, Math.min(Number(body?.limit) || CLAIM_LIMIT, CLAIM_LIMIT)).all()
+      return runnerJson({ rows: results })
+    }
+
+    // One tick of the watcher: store whatever the job has printed so far and
+    // report the two flags back. Progress is only written while the row is
+    // still running, so a finished row is never overwritten by a late tick.
+    case 'heartbeat': {
+      if (typeof body?.output === 'string') {
+        await env.DB.prepare(
+          `UPDATE commands SET output = ?, updated_at = datetime('now')
+           WHERE id = ? AND status = 'running'`,
+        ).bind(body.output, id).run()
+      }
+      const row = await env.DB.prepare(
+        `SELECT COALESCE(background, 0) AS background, COALESCE(cancel, 0) AS cancel
+         FROM commands WHERE id = ?`,
+      ).bind(id).first<{ background: number; cancel: number }>()
+      if (!row) return runnerJson({ error: 'no such row' }, 404)
+      return runnerJson({ background: Number(row.background), cancel: Number(row.cancel) })
+    }
+
+    case 'result': {
+      const status = String(body?.status ?? '')
+      if (!TERMINAL.includes(status)) return runnerJson({ error: `bad status: ${status}` }, 400)
+      await env.DB.prepare(
+        `UPDATE commands SET status = ?, exit_code = ?, output = ?, updated_at = datetime('now')
+         WHERE id = ?`,
+      ).bind(status, Number(body?.exitCode ?? -1), String(body?.output ?? ''), id).run()
+      return runnerJson({ ok: true })
+    }
+
+    // Rows this runner left 'running': 'orphans' at startup (it restarted and
+    // took its children with it), 'stale' for one whose runner hung rather
+    // than restarted, which only the timeout can tell apart.
+    case 'sweep': {
+      const orphans = body?.kind === 'orphans'
+      const note = orphans
+        ? 'runlet: the runner restarted while this was running; the command may or may not have completed'
+        : 'runlet: ran past the timeout without reporting; the runner may have hung'
+      const sql = `UPDATE commands SET status = 'error', exit_code = -1, output = ?,
+                     updated_at = datetime('now')
+                   WHERE status = 'running' AND ` + (orphans
+        ? '(runner = ? OR runner IS NULL)'
+        : "runner = ? AND updated_at < datetime('now', ?)")
+      const stmt = orphans
+        ? env.DB.prepare(sql).bind(note, runner)
+        : env.DB.prepare(sql).bind(note, runner, `-${Math.max(Number(body?.staleSeconds) || 720, 60)} seconds`)
+      const { meta } = await stmt.run()
+      return runnerJson({ changed: meta?.changes ?? 0 })
+    }
+
+    case 'prune': {
+      const days = Math.max(Number(body?.keepDays) || 30, 1)
+      const { meta } = await env.DB.prepare(
+        `DELETE FROM commands WHERE status NOT IN ('pending', 'running')
+         AND created_at < datetime('now', ?)`,
+      ).bind(`-${days} days`).run()
+      return runnerJson({ changed: meta?.changes ?? 0 })
+    }
+
+    // Backs `runlet status`, so the owner can ask a machine what it has been
+    // doing without a Cloudflare credential in the picture.
+    case 'status': {
+      const { results = [] } = await env.DB.prepare(
+        `SELECT id, status, exit_code, runner, created_at, updated_at,
+                substr(replace(replace(command, char(10), ' '), char(9), ' '), 1, 50) AS command,
+                substr(replace(output, char(10), ' | '), 1, 70) AS output
+         FROM commands ORDER BY id DESC LIMIT ?`,
+      ).bind(Math.min(Math.max(Number(body?.limit) || 10, 1), 100)).all()
+      return runnerJson({ rows: results })
+    }
+
+    default:
+      return runnerJson({ error: `unknown op: ${body?.op}` }, 400)
+  }
+}
+
 function clampWait(env: Env, asked: unknown, fallback: number): number {
   const max = Number(env.RUNLET_WAIT_MAX ?? WAIT_MAX)
   const n = Number(asked ?? fallback)
@@ -232,6 +359,9 @@ export default {
     // The path IS the credential. Constant-time compare, and every miss is a
     // plain 404 so the endpoint cannot be found by probing.
     const parts = url.pathname.split('/').filter(Boolean)
+    // The runner's own API, on a fixed path behind a Bearer token. Checked
+    // first so it never has to be reachable through the assistant's secret.
+    if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
     if (parts.length !== 2 || parts[1] !== 'mcp' || !env.RUNLET_URL_SECRET || !timingSafeEqual(parts[0], env.RUNLET_URL_SECRET)) {
       return new Response('not found', { status: 404 })
     }

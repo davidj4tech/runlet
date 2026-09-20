@@ -28,6 +28,8 @@ jobs:
         run: /bin/bash tests/check-signing.sh
       - name: Installer and process behavior
         run: python3 tests/check-platform.py
+      - name: Worker runner API
+        run: node --experimental-strip-types --experimental-sqlite --no-warnings tests/check-worker.mjs
 
   # The Node runner is a separate implementation with its own OS plumbing --
   # taskkill, powershell.exe, %LOCALAPPDATA% -- that no POSIX runner reaches.
