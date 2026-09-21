@@ -176,9 +176,12 @@ becomes the one place to see what every agent is doing.
     `SASONICA_HMAC_KEY`, bound to the URL's label) and reads it on later
     requests; a client that does not echo it still works. Attribution on a
     shared URL, not security.
+  - `name`: a label the caller puts in the URL, `/<secret>/<name>/mcp` or
+    `?as=<name>` (`sasonica url --name`); it tells apart connectors on one
+    secret, and is in the session id's MAC, but grants nothing.
 
-  `sasonica status` shows both as `client/agent`; the thread below can name
-  itself from them.
+  `sasonica status` shows `client/agent`, or `client/name (agent)` when the
+  URL carried a name; the thread below can name itself from them.
 - **The thread.** The runner already sees every row. It appends each row
   (client, command or tool call, status, trimmed output) to a local
   journal, and agent-media reads that journal as a thread source. In

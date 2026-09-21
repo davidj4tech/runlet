@@ -289,6 +289,8 @@ The full connector URL is:
 <SASONICA_WORKER_URL>/<SASONICA_URL_SECRET>/mcp
 ```
 
+`sasonica url` prints the same thing; `sasonica url --name desk` prints it as `.../<secret>/desk/mcp`, so the rows that connector queues say `desk`. The name labels, it does not protect: every form is the same password.
+
 Keep it private when copying or displaying it.
 
 ## Tune the runner

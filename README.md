@@ -109,7 +109,7 @@ Sasonica Shell is intentionally capability-based and minimal. It does not try to
 
 ### Secret connector URL
 
-The endpoint is `/<secret>/mcp`; other paths, and revoked secrets, return 404. The secret is five random words from the bundled EFF short wordlist by default, roughly 52 bits of entropy. The comparison is constant-time.
+The endpoint is `/<secret>/mcp`, or `/<secret>/<name>/mcp` with a name that only labels the rows (see *Several assistants*); other paths, and revoked secrets, return 404. The secret is five random words from the bundled EFF short wordlist by default, roughly 52 bits of entropy. The comparison is constant-time.
 
 Use `SASONICA_SECRET_WORDS=6` during installation if you want a longer secret. Fewer than four words are refused.
 
@@ -119,24 +119,34 @@ To rotate a leaked connector URL, remove `SASONICA_URL_SECRET` from `~/.config/s
 
 One shared URL is fine for several assistants: Claude.ai, ChatGPT and a phone app can all use it, and every row still says who asked (see *Who asked*, below).
 
+To tell connectors on the same secret apart, give each a name in its URL. The name goes between the secret and `/mcp`, so the URL still ends in `/mcp` (some connector UIs check):
+
+```text
+https://sasonica-shell-example.example.workers.dev/<secret>/desk/mcp
+https://sasonica-shell-example.example.workers.dev/<secret>/phone/mcp
+```
+
+`sasonica url --name desk` prints the first; `sasonica url` alone prints the bare shared URL. A name is `[a-z0-9._-]`, up to 32 characters, lowercased; anything else in that slot is a 404. `?as=desk` on either form works too (the path wins if both are given; an invalid `?as=` is ignored). **The name is not a credential**: the secret alone decides access, and it works under any name, so every form of the URL is a password.
+
 Give an assistant a URL of its own when you want to be able to cut it off without re-pasting a new URL into all the others:
 
 ```bash
-sasonica client add chatgpt      # prints https://.../<secret>/mcp once
+sasonica client add chatgpt      # prints https://.../<secret>/chatgpt/mcp once
 sasonica client list             # label, created, revoked, last used
 sasonica client revoke chatgpt   # that URL is a 404 within 30 seconds
 ```
 
-Only the sha256 of each secret is stored, so the URL cannot be printed again; `add` a new label, or revoke and re-`add` the same one, if it is lost. A revocation takes effect within **30 seconds**: each Worker isolate remembers a lookup for that long so that a burst of calls costs one D1 read. The shared URL is the client `default`; `sasonica client revoke default` turns it off (per-client URLs keep working) until you rotate `SASONICA_URL_SECRET`.
+`add` prints the named form, with the label as the name, so the URL says whose it is; the secret still decides the client. Only the sha256 of each secret is stored, so the URL cannot be printed again; `add` a new label, or revoke and re-`add` the same one, if it is lost. A revocation takes effect within **30 seconds**: each Worker isolate remembers a lookup for that long so that a burst of calls costs one D1 read. The shared URL is the client `default`; `sasonica client revoke default` turns it off (per-client URLs keep working) until you rotate `SASONICA_URL_SECRET`.
 
 These commands write the `clients` table with the Cloudflare token the installer used, from `CLOUDFLARE_API_TOKEN` or `~/.config/sasonica/install-token`. The runner's own token cannot mint URLs, by design: it is the credential that sits on the machine all day.
 
 ### Who asked
 
-Every row records two things, and `sasonica status` shows them as `client/agent`, e.g. `default/claude.ai` or `default/chatgpt`:
+Every row records three things. `sasonica status` shows them as `client/agent`, e.g. `default/claude.ai` or `default/chatgpt`, and as `client/name (agent)` when the URL carried a name, e.g. `default/desk (claude.ai)`:
 
-- **client**: which URL queued it (`default` or a label from `sasonica client`). This is the one that means something, because the URL is the credential.
-- **agent**: what the assistant says it is. The Worker reads `clientInfo.name` from MCP `initialize` (falling back to the first token of the `User-Agent`, written `ua:...`) and hands it back inside a signed `Mcp-Session-Id`, which clients send on later requests. Any client can claim any name, so this is attribution, not security; a client that does not echo the session id is still served, and its rows fall back to `ua:...` or `unknown`. The assistants people actually connect get the name a person would use — Claude.ai's connector (`Claude-User`) reads as `claude.ai`, ChatGPT's (`openai-mcp`) as `chatgpt` — from a short table in the Worker (`FRIENDLY`); anything else keeps its own name.
+- **client**: which URL queued it (`default` or a label from `sasonica client`). This is the one that means something, because the URL's secret is the credential.
+- **name**: the name in the URL (`/<secret>/desk/mcp`, or `?as=desk`), if it had one. Whoever pasted the URL chose it; it tells apart connectors that share a secret, and decides nothing.
+- **agent**: what the assistant says it is. The Worker reads `clientInfo.name` from MCP `initialize` (falling back to the first token of the `User-Agent`, written `ua:...`) and hands it back inside a signed `Mcp-Session-Id`, which clients send on later requests. Any client can claim any name, so this is attribution, not security; the session id is bound to the URL's client and name, so it does not carry over to another URL or another name. A client that does not echo the session id is still served, and its rows fall back to `ua:...` or `unknown`. The assistants people actually connect get the name a person would use — Claude.ai's connector (`Claude-User`) reads as `claude.ai`, ChatGPT's (`openai-mcp`) as `chatgpt` — from a short table in the Worker (`FRIENDLY`); anything else keeps its own name.
 
 ### Signed rows
 
