@@ -133,10 +133,10 @@ These commands write the `clients` table with the Cloudflare token the installer
 
 ### Who asked
 
-Every row records two things, and `sasonica status` shows them as `client/agent`, e.g. `default/claude-ai@1.0`:
+Every row records two things, and `sasonica status` shows them as `client/agent`, e.g. `default/claude.ai` or `default/chatgpt`:
 
 - **client**: which URL queued it (`default` or a label from `sasonica client`). This is the one that means something, because the URL is the credential.
-- **agent**: what the assistant says it is. The Worker reads `clientInfo.name` from MCP `initialize` (falling back to the first token of the `User-Agent`, written `ua:...`) and hands it back inside a signed `Mcp-Session-Id`, which clients send on later requests. Any client can claim any name, so this is attribution, not security; a client that does not echo the session id is still served, and its rows fall back to `ua:...` or `unknown`.
+- **agent**: what the assistant says it is. The Worker reads `clientInfo.name` from MCP `initialize` (falling back to the first token of the `User-Agent`, written `ua:...`) and hands it back inside a signed `Mcp-Session-Id`, which clients send on later requests. Any client can claim any name, so this is attribution, not security; a client that does not echo the session id is still served, and its rows fall back to `ua:...` or `unknown`. The assistants people actually connect get the name a person would use — Claude.ai's connector (`Claude-User`) reads as `claude.ai`, ChatGPT's (`openai-mcp`) as `chatgpt` — from a short table in the Worker (`FRIENDLY`); anything else keeps its own name.
 
 ### Signed rows
 

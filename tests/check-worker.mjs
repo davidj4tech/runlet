@@ -329,7 +329,7 @@ const cases = {
 
     await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 },
       { headers: { 'mcp-session-id': sid, 'user-agent': 'Claude-User' } });
-    assert.equal(f.row(1).agent, 'claude-ai@0.1.0');
+    assert.equal(f.row(1).agent, 'claude.ai');
     assert.equal(f.row(1).client, 'default');
   },
 
@@ -385,7 +385,7 @@ const cases = {
     const env = envFor(f.binding);
     const ua = await mcp(env, URL_SECRET, 'initialize', {}, { method: 'initialize', headers: { 'user-agent': 'Claude-User' } });
     const sid = ua.headers.get('mcp-session-id');
-    assert.equal(await mod.agentFromSessionId(env, 'default', sid), 'ua:Claude-User');
+    assert.equal(await mod.agentFromSessionId(env, 'default', sid), 'claude.ai');
     const none = await mcp(env, URL_SECRET, 'initialize', {}, { method: 'initialize' });
     assert.equal(none.status, 200);
     assert.equal(none.headers.get('mcp-session-id'), null);
@@ -399,7 +399,17 @@ const cases = {
       { headers: { 'user-agent': 'openai-mcp/1.0' } });
     const r = await call(envFor(f.binding), { op: 'status', limit: 5 });
     assert.equal(r.body.rows[0].client, 'chatgpt');
-    assert.equal(r.body.rows[0].agent, 'ua:openai-mcp/1.0');
+    assert.equal(r.body.rows[0].agent, 'chatgpt');
+  },
+
+  // The assistants people connect read as people name them; anything else
+  // keeps its own name, so a newcomer is still told apart.
+  async friendlyNames() {
+    assert.equal(mod.friendly('Claude-User'), 'claude.ai');
+    assert.equal(mod.friendly('openai-mcp/1.0.0'), 'chatgpt');
+    assert.equal(mod.friendly('python-httpx/0.28.1'), null);
+    assert.equal(mod.agentFromInitialize({ clientInfo: { name: 'claude-ai', version: '0.1.0' } }), 'claude.ai');
+    assert.equal(mod.agentFromInitialize({ clientInfo: { name: 'cursor', version: '2' } }), 'cursor@2');
   },
 };
 

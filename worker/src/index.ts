@@ -156,20 +156,40 @@ function cleanName(raw: unknown, max = 64): string {
   return String(raw ?? '').replace(/[^\x21-\x7e ]/g, '').trim().replace(/\s+/g, '-').slice(0, max)
 }
 
+// The assistants people actually connect, by what they call themselves, and
+// the name a person would call them. Matched case-insensitively on the name
+// with any "/version" dropped. Measured 2026-09-21: Claude.ai's connector
+// sends the User-Agent "Claude-User", ChatGPT's "openai-mcp/1.0.0"; neither
+// had echoed a session id by then, so the User-Agent is what names them.
+// Anything not listed keeps its raw form, so a new assistant is still told
+// apart -- it just reads less kindly until it is added here.
+const FRIENDLY: Record<string, string> = {
+  'claude-user': 'claude.ai',
+  'claude-ai': 'claude.ai',
+  'openai-mcp': 'chatgpt',
+}
+export function friendly(name: string): string | null {
+  return FRIENDLY[name.split('/')[0].toLowerCase()] ?? null
+}
+
 /** The name an initialize request gives: clientInfo.name, with its version. */
 export function agentFromInitialize(params: any): string | null {
   const name = cleanName(params?.clientInfo?.name, 48)
   if (!name) return null
+  const known = friendly(name)
+  if (known) return known
   const version = cleanName(params?.clientInfo?.version, 15)
   return version ? `${name}@${version}` : name
 }
 
 // The first product token of the User-Agent ("Claude-User",
-// "python-httpx/0.28.1"), marked as such: it is a weaker claim than
-// clientInfo, and the row should say which one it is.
+// "python-httpx/0.28.1"). A known one gets its friendly name; an unknown one
+// is marked as such: it is a weaker claim than clientInfo, and the row should
+// say which one it is.
 function agentFromUserAgent(request: Request): string | null {
   const first = cleanName((request.headers.get('user-agent') ?? '').trim().split(/\s+/)[0], 60)
-  return first ? `ua:${first}` : null
+  if (!first) return null
+  return friendly(first) ?? `ua:${first}`
 }
 
 // --- the session id ------------------------------------------------------------
