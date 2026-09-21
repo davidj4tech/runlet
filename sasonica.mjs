@@ -18,6 +18,8 @@
 //         sasonica skills        the skills listed in SASONICA_SKILLS_DIR
 //         sasonica client add|list|revoke [label]
 //                                per-assistant connector URLs (lib/clients.mjs)
+//         sasonica url [--name <n>]
+//                                the shared connector URL, optionally named
 //         sasonica sign <nonce> <command>
 //         sasonica install [shell] [--no-service|--print-url]
 //                                hand over to install.mjs beside this file
@@ -32,7 +34,7 @@ import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, rea
 import { homedir, hostname, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { renderShim } from './lib/install-lib.mjs';
+import { renderShim, connectorUrl, URL_NAME_RE } from './lib/install-lib.mjs';
 import { clientCommand } from './lib/clients.mjs';
 
 const WIN = process.platform === 'win32';
@@ -154,6 +156,11 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
   sasonica client add <label> | list | revoke <label>
                          one connector URL per assistant, each revocable on its own
                          (needs the installer's Cloudflare token, not the runner's)
+  sasonica url [--name <n>]
+                         the shared connector URL; --name puts a label in it
+                         (.../<secret>/<n>/mcp) so rows say which connector queued
+                         them. Every form of it is a PASSWORD: whoever has it can
+                         run commands here. Paste it only into a connector.
   sasonica --once        one poll, then exit
   sasonica               poll forever (what the service runs)
   sasonica sign <nonce> <command>   the signature this runner expects
@@ -256,6 +263,35 @@ if (sub === 'client') {
   }));
 }
 
+// `url [--name <n>]`: the shared connector URL, from the env file, with the
+// name slot filled when asked. Reads the env file only, like
+// `install --print-url`, and needs neither the runner token nor Cloudflare.
+// The name labels the rows the URL queues; the secret is the credential, so
+// this prints a password whatever name it carries.
+if (sub === 'url') {
+  const usage = 'usage: sasonica url [--name <n>]    prints the shared connector URL -- a password;\n'
+    + `       name: ${URL_NAME_RE.source.slice(1, -1)} (lowercased)`;
+  let name = null;
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === '-h' || a === '--help') { console.log(usage); process.exit(0); }
+    const m = /^--name(?:=(.*))?$/.exec(a);
+    if (!m) { console.error(usage); process.exit(2); }
+    const raw = m[1] ?? rest[++i];
+    name = String(raw ?? '').toLowerCase();
+    if (!URL_NAME_RE.test(name)) {
+      console.error(`sasonica url: the name must match ${URL_NAME_RE.source} after lowercasing`);
+      process.exit(2);
+    }
+  }
+  if (!cfg.SASONICA_WORKER_URL || !cfg.SASONICA_URL_SECRET) {
+    console.error(`${ENV_FILE} lacks SASONICA_WORKER_URL or SASONICA_URL_SECRET: run the installer first`);
+    process.exit(1);
+  }
+  console.log(connectorUrl(cfg.SASONICA_WORKER_URL, cfg.SASONICA_URL_SECRET, name));
+  process.exit(0);
+}
+
 // The runner token goes on every request, so the Worker URL must be https --
 // over plaintext to anything but this machine it would be handed to whoever
 // is listening. Loopback is allowed because the tests serve the real Worker
@@ -279,12 +315,18 @@ if (urlProblem || !RUNNER_TOKEN) {
 if (sub === 'status') {
   const limit = /^[1-9][0-9]*$/.test(rest[0] ?? '') ? Number(rest[0]) : 10;
   const { rows } = await api('status', { limit });
+  // client/agent: which URL queued it, and what the assistant called itself;
+  // client/name (agent) when the URL carried a name, since the name is the
+  // one a person chose. Rows from before either was recorded show '-'.
+  const whoOf = (r) => (r.name
+    ? `${r.client ?? '-'}/${r.name} (${r.agent ?? '-'})`
+    : `${r.client ?? '-'}/${r.agent ?? '-'}`);
+  // Padded to the widest on screen: the field now runs from '-/-' to past
+  // forty characters, and a tab alone would scatter the command column.
+  const width = Math.max(0, ...rows.map((r) => whoOf(r).length));
   for (const r of rows) {
     const code = r.exit_code === null ? '' : ` exit=${r.exit_code}`;
-    // client/agent: which URL queued it, and what the assistant called
-    // itself. Rows from before either was recorded show '-'.
-    const who = `${r.client ?? '-'}/${r.agent ?? '-'}`;
-    console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${who}\t${r.command}`);
+    console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${whoOf(r).padEnd(width)}\t${r.command}`);
     console.log(`\t\t\t\t${r.output ?? ''}`);
   }
   process.exit(0);

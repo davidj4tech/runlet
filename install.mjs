@@ -25,7 +25,7 @@ import { homedir, hostname, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { cfRequest } from './lib/cloudflare.mjs';
-import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim,
+import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim, connectorUrl,
          winShellCommand, needsWindowsShell } from './lib/install-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -129,7 +129,7 @@ if (PRINT_URL) {
     console.error(`${ENV_FILE} lacks SASONICA_WORKER_URL or SASONICA_URL_SECRET: run the installer first`);
     process.exit(1);
   }
-  console.log(`${url}/${secret}/mcp`);
+  console.log(connectorUrl(url, secret));
   process.exit(0);
 }
 

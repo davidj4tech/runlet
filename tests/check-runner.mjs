@@ -202,10 +202,11 @@ const cliEnv = (conf, api, extra = {}) => {
 
 // One MCP call through the real Worker, over the same database, with a cold
 // client cache -- what a fresh isolate would answer.
-async function mcpStatus(db, secret, shared = 'shared-url-secret') {
+// `path` replaces /<secret>/mcp, to try a URL exactly as it was printed.
+async function mcpStatus(db, secret, shared = 'shared-url-secret', path = `/${secret}/mcp`) {
   workerModule.resetClientCache();
   const env = { DB: db.binding, SASONICA_HMAC_KEY: KEY, SASONICA_URL_SECRET: shared, SASONICA_RUNNER_TOKEN: RUNNER_TOKEN };
-  const r = await worker.fetch(new Request(`https://w.example/${secret}/mcp`, {
+  const r = await worker.fetch(new Request(`https://w.example${path}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
       params: { name: 'run_command', arguments: { command: 'true', wait: 0 } } }),
@@ -510,7 +511,7 @@ const cases = {
     const env = { ...process.env, SASONICA_CONF: empty, HOME: empty, USERPROFILE: empty };
     delete env.SASONICA_KEY;
     const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
-    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica install', 'SASONICA_WORKER_URL']) {
+    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica url', 'sasonica install', 'SASONICA_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
     rmSync(empty, { recursive: true, force: true });
@@ -524,6 +525,8 @@ const cases = {
       { ...job('echo two'), status: 'running', runner: 'w' },
     ]);
     db.db.prepare(`UPDATE commands SET client = 'default', agent = 'claude-ai' WHERE id = 2`).run();
+    db.add({ ...job('echo three'), status: 'done', exit_code: 0 });
+    db.db.prepare(`UPDATE commands SET client = 'default', name = 'desk', agent = 'claude.ai' WHERE id = 3`).run();
     const env = {
       DB: db.binding, SASONICA_HMAC_KEY: KEY,
       SASONICA_URL_SECRET: 'unused-here', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
@@ -537,11 +540,16 @@ const cases = {
     try { await import(pathToFileURL(RUNNER).href); }
     catch (e) { if (e.message !== '__exit__') throw e; }
     finally { console.log = realLog; process.exit = realExit; }
-    // Newest first, and a row still running has no exit code to show.
-    assert.match(out[0], /^#2\trunning\t\S+ \S+\tdefault\/claude-ai\techo two$/);
-    assert.ok(!/exit=/.test(out[0]), `a running row must not show an exit code: ${out[0]}`);
-    assert.match(out[2], /^#1\tdone exit=0\t\S+ \S+\t-\/-\t/, 'a row from before attribution shows -/-');
-    assert.match(out[3], /first \| second/);      // newlines folded onto one line
+    // Newest first. A named URL reads client/name (agent); an unnamed one
+    // client/agent, as before; the field is padded so commands line up.
+    const w = 'default/desk (claude.ai)'.length;
+    assert.match(out[0], /^#3\tdone exit=0\t\S+ \S+\tdefault\/desk \(claude\.ai\)\techo three$/);
+    assert.equal(out[2].split('\t')[3], 'default/claude-ai'.padEnd(w));
+    assert.match(out[2], /^#2\trunning\t\S+ \S+\tdefault\/claude-ai +\techo two$/);
+    assert.ok(!/exit=/.test(out[2]), `a running row must not show an exit code: ${out[2]}`);
+    assert.match(out[4], /^#1\tdone exit=0\t\S+ \S+\t-\/- +\t/, 'a row from before attribution shows -/-');
+    assert.equal(out[4].split('\t')[3].length, w);
+    assert.match(out[5], /first \| second/);      // newlines folded onto one line
   },
 };
 
@@ -560,14 +568,20 @@ const clientCases = {
     assert.equal(added.code, 0, added.err);
     const url = /(https:\/\/\S+\/mcp)/.exec(added.out)?.[1];
     assert.ok(url?.startsWith('https://shell.example.workers.dev/'), `no URL printed: ${added.out}`);
-    const secret = url.split('/').at(-2);
+    // The named form, the label in the name slot, so the URL says whose it is.
+    assert.match(url, /^https:\/\/shell\.example\.workers\.dev\/[^/]+\/chatgpt\/mcp$/);
+    const secret = url.split('/').at(-3);
     // Only the hash is stored.
     const row = db.db.prepare(`SELECT * FROM clients WHERE label = 'chatgpt'`).get();
     assert.equal(row.secret_sha256, createHash('sha256').update(secret).digest('hex'));
     assert.equal(row.revoked_at, null);
 
-    assert.equal(await mcpStatus(db, secret), 200, 'the new URL should work at once');
-    assert.equal(db.row(1).client, 'chatgpt');
+    assert.equal(await mcpStatus(db, secret, undefined, new URL(url).pathname), 200,
+      'the new URL, as printed, should work at once');
+    assert.deepEqual([db.row(1).client, db.row(1).name], ['chatgpt', 'chatgpt']);
+    // The secret decides the client; the bare form works as well.
+    assert.equal(await mcpStatus(db, secret), 200);
+    assert.deepEqual([db.row(2).client, db.row(2).name], ['chatgpt', null]);
 
     const dup = await runCli(['add', 'chatgpt'], env);
     assert.equal(dup.code, 1);
@@ -592,7 +606,7 @@ const clientCases = {
     // Reissuing a revoked label: a new secret, and the old one stays dead.
     const reissued = await runCli(['add', 'chatgpt'], env);
     assert.equal(reissued.code, 0, reissued.err);
-    const secret2 = /\/([^/\s]+)\/mcp/.exec(reissued.out)[1];
+    const secret2 = /\/([^/\s]+)\/chatgpt\/mcp/.exec(reissued.out)[1];
     assert.notEqual(secret2, secret);
     assert.equal(await mcpStatus(db, secret2), 200);
     assert.equal(await mcpStatus(db, secret), 404);
@@ -606,7 +620,7 @@ const clientCases = {
     const conf = clientConf();
     const env = cliEnv(conf, api, { CLOUDFLARE_API_TOKEN: CF_TOKEN });
     const added = await runCli(['add', 'laptop'], env);
-    const laptop = /\/([^/\s]+)\/mcp/.exec(added.out)[1];
+    const laptop = /\/([^/\s]+)\/laptop\/mcp/.exec(added.out)[1];
     const r = await runCli(['revoke', 'default'], env);
     assert.equal(r.code, 0, r.err);
     assert.equal(await mcpStatus(db, 'shared-url-secret'), 404);
@@ -692,6 +706,38 @@ const cliCases = {
     assert.equal(refused.status, 2);
     assert.match(String(refused.stderr), /only the shell exists/);
     rmSync(tmp, { recursive: true, force: true });
+  },
+
+  // `sasonica url [--name <n>]`: the shared URL from the env file, with the
+  // name slot filled when asked. Needs no runner token and no Cloudflare
+  // credential, and refuses a name the Worker would 404.
+  urlCommand() {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'sasonica-url-'));
+    writeFileSync(path.join(tmp, 'env'),
+      'SASONICA_WORKER_URL=https://w.example/\nSASONICA_URL_SECRET=one-two-three-four\n');
+    const env = { ...process.env, SASONICA_CONF: tmp };
+    delete env.SASONICA_RUNNER_TOKEN; delete env.SASONICA_WORKER_URL; delete env.SASONICA_URL_SECRET;
+    const url = (...argv) => execFileSync(process.execPath, [RUNNER, 'url', ...argv], { env, encoding: 'utf8' }).trim();
+    assert.equal(url(), 'https://w.example/one-two-three-four/mcp');
+    assert.equal(url('--name', 'desk'), 'https://w.example/one-two-three-four/desk/mcp');
+    assert.equal(url('--name=Phone.2'), 'https://w.example/one-two-three-four/phone.2/mcp', 'lowercased');
+    assert.match(url('--help'), /password/i);
+    const fails = (argv, conf = tmp) => {
+      try { execFileSync(process.execPath, [RUNNER, 'url', ...argv], { env: { ...env, SASONICA_CONF: conf }, stdio: 'pipe' }); }
+      catch (e) { return e; }
+      assert.fail(`sasonica url ${argv.join(' ')} should have failed`);
+    };
+    for (const bad of [['--name', 'has space'], ['--name', 'x'.repeat(33)], ['--name', 'a/b'], ['--name'], ['--name='], ['desk']]) {
+      const e = fails(bad);
+      assert.equal(e.status, 2, `sasonica url ${bad.join(' ')}`);
+      assert.equal(String(e.stdout), '', 'a refused name must print no URL');
+    }
+    const empty = mkdtempSync(path.join(tmpdir(), 'sasonica-url-none-'));
+    const missing = fails([], empty);
+    assert.equal(missing.status, 1);
+    assert.match(String(missing.stderr), /run the installer first/);
+    rmSync(tmp, { recursive: true, force: true });
+    rmSync(empty, { recursive: true, force: true });
   },
 
   skillsListing() {
