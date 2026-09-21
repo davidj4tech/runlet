@@ -197,3 +197,8 @@ The only thing that tied it to Audiobookshelf was the fork, which is going. If
 kept: Sasonica is the umbrella and the app; Runlet stays the shell's name
 ("Sasonica Shell, built on Runlet"); the link hostname lives under
 sasonica.com; the `applicationId` can stay `com.sasonica.app`, so no reinstall.
+
+## Related
+
+- agent-media side: `agent-media/docs/simplification-plan.md` (rooms as a
+  plugin destination, the ABS exit, splitting the CLI, the server contract).
