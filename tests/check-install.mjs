@@ -174,6 +174,13 @@ const cases = {
     assert.match(src, /Workers Scripts: Edit and D1:/);
   },
 
+  // The MCP path carries the connector secret, and invocation logs record
+  // every request's URL -- so they stay off in what the installer deploys.
+  invocationLogsStayOff() {
+    const tpl = readFileSync(path.join(ROOT, 'worker', 'wrangler.jsonc.template'), 'utf8');
+    assert.match(tpl, /"invocation_logs":\s*false/, 'invocation logs would record the secret URL');
+  },
+
   // Runlet became Sasonica Shell on 21 Sep 2026, and every name a machine
   // ends up holding moved with it. A stray old name here would make a fresh
   // install land beside the old one under the old name -- or, worse, a re-run
