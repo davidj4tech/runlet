@@ -4,7 +4,7 @@ Status: **proposal; §3's client labels are built** (21 Sep 2026), the rest is n
 (Claude.ai, ChatGPT custom connectors, any remote MCP host) fit into the
 Sasonica umbrella (`umbrella.md`) beyond "a shell with a skills list".
 
-Five changes, most useful first. The first two are the ones worth building
+Six changes, most useful first. The first two are the ones worth building
 soon; they reinforce each other.
 
 ## Where it stands
@@ -230,6 +230,86 @@ of milliseconds instead of a poll interval, and idle D1 reads drop to
 almost nothing. This is the least urgent of the five — the queue works —
 but it is the one that makes interactive use (§4) feel immediate.
 
+## 6. Sign-in instead of a secret URL
+
+**The problem.** The connector URL is the only credential, and it opens a
+shell as the owner. URLs travel further than passwords do:
+- they are stored in each assistant's connector settings, so Anthropic's and
+  OpenAI's security is part of ours;
+- they end up in history and screenshots;
+- they are **probably recorded in Cloudflare's own Workers Logs**:
+  `observability` is on, and the path holds the secret. Not verified — the
+  install token cannot read logs.
+
+A leak is silent and lasts until the secret is rotated. §2 approvals limit
+what a leaked URL can *do*; this section removes the secret from the URL.
+
+**The idea.** The Worker becomes an OAuth 2.1 authorization server for its
+own MCP endpoint, and it delegates the question "is this the owner?" to an
+identity provider the installer sets up.
+
+```
+assistant ──(adds connector: plain URL, no secret)──▶ Worker /mcp → 401
+assistant ──registers itself (dynamic client registration)──▶ Worker
+you ──sent to Worker /authorize──▶ identity provider ──"yes, it's you"──▶ Worker
+Worker ──issues an access token (expiring, revocable, per assistant)──▶ assistant
+assistant ──Bearer token on every call──▶ Worker /mcp
+```
+
+- **Library:** Cloudflare's `workers-oauth-provider`, the documented way to
+  put OAuth in front of an MCP server on Workers. It handles discovery, dynamic
+  client registration, PKCE, and token storage in KV, with the grant
+  encrypted so KV alone cannot mint access.
+- **Per-assistant identity comes free.** Each connector registers as its own
+  OAuth client and gets its own grant, so `client` on a row becomes the
+  registered client — trustworthy, and revocable one at a time without
+  inventing secrets (§3's per-client URLs become unnecessary for this).
+- **Revocation and expiry:** `sasonica client list` shows the grants and
+  `revoke` ends one. Access tokens expire, and refresh tokens are revocable.
+
+### The identity provider (the installer's question)
+
+`sasonica install shell` asks how the owner proves who they are:
+
+| Provider | How | Setup the installer can do |
+| --- | --- | --- |
+| **The Sasonica app (recommended)** | The authorize page shows "approve on your phone" plus a short code; the app, holding its paired device token (agent-media server contract §9), shows the request, and a tap approves it | Nothing extra — pairing already happened. The Worker must reach the approval, which needs the Sasonica link (Tunnel) or a relay through the Worker the app polls. **Open question**, below |
+| Cloudflare Access | Access protects `/authorize`; one-time PIN to the owner's email, or a Google/GitHub login configured in Access | Fully automatic with one more token permission (Access: Apps and Policies: Edit) |
+| GitHub or Google OAuth | `/authorize` redirects to the provider; the Worker checks the returned account against the owner's | The OAuth app is created by hand in their console; the installer asks for the client id and secret |
+
+**Why the phone.** It makes the phone the one identity across the umbrella:
+pairing the app, signing a connector in, and (§2) approving a command become
+the same gesture. It also needs no third-party account, which matters once
+people other than David install this. Cloudflare Access is the fallback for
+an install with no app.
+
+### Migration
+
+- The secret URL keeps working **alongside** OAuth until the owner turns it
+  off: `sasonica client revoke default`, which exists today.
+- Named URLs (`/<secret>/<name>/mcp`) stay meaningful only on the secret
+  path. With OAuth, the name comes from the registered client, or a name the
+  owner gives the grant when approving it.
+- Turn off URL logging (or strip the path from what is logged) regardless of
+  OAuth: that is a small change, and worth doing first.
+
+### Open questions — verify before building
+
+- **What each assistant supports today.** Claude.ai and ChatGPT custom
+  connectors both document OAuth with dynamic client registration, but the
+  details (scopes, whether refresh tokens are used, redirect URI allow-lists,
+  whether a no-auth connector can be switched to OAuth in place or must be
+  re-added) have changed before. Check their current docs and test each.
+- **How the phone approval reaches the Worker.** The Worker is on Cloudflare
+  and the app talks to agent-media over the tailnet. Either the Worker holds a
+  pending approval that the app fetches (the Worker then needs to trust the
+  device token — a verification key shared at pairing), or the approval goes
+  phone → agent-media → Worker over the Sasonica link. The first is simpler
+  and keeps the link optional.
+- **Prompt injection is untouched.** OAuth proves the connector is yours; it
+  does not stop your own assistant from being talked into running something.
+  That remains §2's job.
+
 ## Order
 
 1. §3's client labels — tiny, and every later step wants to know who asked.
@@ -240,6 +320,9 @@ but it is the one that makes interactive use (§4) feel immediate.
 4. §4 `ask_session`, gated by §2.
 5. §3's thread view in the app.
 6. §5 when latency or the D1 quota starts to matter.
+7. §6 in two parts: stop logging the URL path now (small); OAuth with
+   Cloudflare Access first (fully automatic), then the phone as the identity
+   provider once the app's pairing and approvals exist.
 
 ## Not proposed
 
