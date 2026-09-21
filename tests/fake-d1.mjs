@@ -3,7 +3,7 @@
 // claim all behave as they do on D1. Needs Node 22.5+ (--experimental-sqlite
 // before 24).
 import { DatabaseSync } from 'node:sqlite';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -53,7 +53,7 @@ export function fakeD1(rows = []) {
         },
         async run() {
           const info = db.prepare(sql).run(...params);
-          return { results: [], meta: { changes: Number(info.changes) }, success: true };
+          return { results: [], meta: { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid) }, success: true };
         },
       };
       return stmt;
@@ -73,6 +73,11 @@ export function fakeD1(rows = []) {
     // Flip a flag from outside, the way cancel and detach reach a running job.
     set: (id, column, value) =>
       db.prepare(`UPDATE commands SET ${column} = ? WHERE id = ?`).run(value, id),
+    // A per-client connector URL, stored as `sasonica client add` stores it:
+    // the label and the sha256 of the secret, never the secret.
+    addClient: (label, secret, { revoked = false } = {}) => db.prepare(
+      `INSERT INTO clients (label, secret_sha256, created_at, revoked_at) VALUES (?, ?, ?, ?)`,
+    ).run(label, createHash('sha256').update(secret).digest('hex'), NOW, revoked ? NOW : null),
     // Tests that care about age set it relative to now, so the Worker's own
     // datetime('now', '-N seconds') comparison is the thing under test.
     age: (id, seconds) => db.prepare(

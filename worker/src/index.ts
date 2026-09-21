@@ -12,9 +12,10 @@
  * ##  Whoever can reach this Worker's URL can run arbitrary shell on the   ##
  * ##  runner host. Two things stand in the way:                            ##
  * ##                                                                       ##
- * ##   1. The URL secret. The MCP endpoint is /<SASONICA_URL_SECRET>/mcp, and ##
- * ##      any other path is 404. Treat that URL like a password: it goes   ##
- * ##      into the connector settings of ONE assistant and nowhere else.   ##
+ * ##   1. The URL secret. The MCP endpoint is /<SASONICA_URL_SECRET>/mcp   ##
+ * ##      (or a per-client secret from the `clients` table), and any other ##
+ * ##      path is 404. Treat each URL like a password: it goes into the    ##
+ * ##      connector settings of the assistants you trust and nowhere else. ##
  * ##   2. HMAC. Every row is signed with SASONICA_HMAC_KEY, held only here    ##
  * ##      and on the runner. Database access alone cannot make the runner ##
  * ##      execute anything.                                                ##
@@ -45,6 +46,11 @@ interface Env {
 }
 
 const PROTOCOL_VERSION = '2025-06-18'
+// How long an isolate trusts what it read from the clients table. A revoked
+// URL keeps working for at most this long on an isolate that had just looked
+// it up; README and SETUP say so. Short enough that `sasonica client revoke`
+// is prompt, long enough that a burst of MCP calls costs one D1 read.
+const CLIENT_CACHE_MS = 30_000
 // Cap on any `wait`. The claude.ai connector drops a call that stays silent
 // for about a minute, and sometimes sooner, so a longer wait fails there even
 // though the Worker answers. Measured 2026-09-17; keep this well under that.
@@ -74,6 +80,163 @@ function timingSafeEqual(a: string, b: string): boolean {
   let d = 0
   for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i)
   return d === 0
+}
+
+// --- who is asking -----------------------------------------------------------
+// Two answers, recorded side by side on each row, because they are different
+// kinds of fact:
+//
+//   client  which connector URL the request came through. The URL is the
+//           credential, so this is the one that means something: revoking
+//           it stops that assistant and no other.
+//   agent   what the assistant says it is (clientInfo.name at initialize,
+//           else its User-Agent). Anyone can claim any name; it is there
+//           so a person reading the rows can tell who did what on a URL
+//           several assistants share, not to decide anything.
+
+async function sha256Hex(text: string): Promise<string> {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
+  return [...new Uint8Array(d)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+// The clients table, cached per isolate by the sha256 of the offered secret.
+// A miss is cached too, so probing with one wrong secret does not become a
+// D1 read per request -- but a probe with a new secret each time still is,
+// which is why the cache is bounded rather than trusted to stay small.
+type ClientLookup = { label: string; revoked: boolean } | null
+const clientCache = new Map<string, { at: number; hit: ClientLookup }>()
+
+/** For tests: forget every cached lookup, as a fresh isolate would. */
+export function resetClientCache(): void {
+  clientCache.clear()
+}
+
+async function lookupClient(env: Env, hash: string): Promise<ClientLookup> {
+  const now = Date.now()
+  const cached = clientCache.get(hash)
+  if (cached && now - cached.at < CLIENT_CACHE_MS) return cached.hit
+  let hit: ClientLookup = null
+  try {
+    const row = await env.DB.prepare(`SELECT label, revoked_at FROM clients WHERE secret_sha256 = ?`)
+      .bind(hash).first<{ label: string; revoked_at: string | null }>()
+    if (row) hit = { label: row.label, revoked: row.revoked_at !== null }
+  } catch (e) {
+    // No clients table: a database the installer has not migrated yet. The
+    // shared URL must go on working through that, so this is "no row", and
+    // it is not cached -- the next request looks again.
+    console.error(`sasonica: clients lookup failed (${(e as Error).message}); only the shared URL is accepted`)
+    return null
+  }
+  if (clientCache.size >= 256) clientCache.clear()
+  clientCache.set(hash, { at: now, hit })
+  return hit
+}
+
+// The label a path secret is good for, or null for a 404.
+//
+// The table is asked by hash, so what the database compares is a digest of
+// the secret, not the secret: how long that takes says nothing about how
+// close a guess was. The env secret is compared constant-time as before.
+//
+// A row wins over the env secret. That is how the shared URL is revoked: a
+// 'default' row carrying the hash of SASONICA_URL_SECRET, with revoked_at
+// set. Once the secret is rotated its hash no longer matches that row, and
+// the new shared URL works again.
+export async function clientFor(env: Env, secret: string): Promise<string | null> {
+  if (!secret) return null
+  const hit = await lookupClient(env, await sha256Hex(secret))
+  if (hit) return hit.revoked ? null : hit.label
+  if (env.SASONICA_URL_SECRET && timingSafeEqual(secret, env.SASONICA_URL_SECRET)) return 'default'
+  return null
+}
+
+// Visible ASCII only, and not much of it: this goes into a header, a D1
+// column and a terminal, and nobody needs a 500-character client name.
+function cleanName(raw: unknown, max = 64): string {
+  return String(raw ?? '').replace(/[^\x21-\x7e ]/g, '').trim().replace(/\s+/g, '-').slice(0, max)
+}
+
+/** The name an initialize request gives: clientInfo.name, with its version. */
+export function agentFromInitialize(params: any): string | null {
+  const name = cleanName(params?.clientInfo?.name, 48)
+  if (!name) return null
+  const version = cleanName(params?.clientInfo?.version, 15)
+  return version ? `${name}@${version}` : name
+}
+
+// The first product token of the User-Agent ("Claude-User",
+// "python-httpx/0.28.1"), marked as such: it is a weaker claim than
+// clientInfo, and the row should say which one it is.
+function agentFromUserAgent(request: Request): string | null {
+  const first = cleanName((request.headers.get('user-agent') ?? '').trim().split(/\s+/)[0], 60)
+  return first ? `ua:${first}` : null
+}
+
+// --- the session id ------------------------------------------------------------
+// MCP's streamable HTTP transport (2025-06-18) lets a server hand out an
+// Mcp-Session-Id on the response to initialize; a client then sends it on
+// every later request. Sasonica Shell keeps no sessions, so the id carries
+// the name itself, signed, and a later request can be attributed without a
+// D1 read:
+//
+//     base64url(agent) "." nonce "." hmac
+//
+// The spec asks for visible ASCII and a cryptographically secure, globally
+// unique id: base64url, hex and dots are all visible ASCII, and the random
+// nonce makes each id unique even for the same name.
+//
+// The key is DERIVED from SASONICA_HMAC_KEY, never the key itself. The
+// agent's name is chosen by whoever calls initialize, and with the command
+// key a session id would be a signature over attacker-chosen text: a name
+// shaped like "<nonce>\n<command>" would come back signed as a runnable row.
+// Under a derived key it signs nothing the runner would accept. The URL's
+// client label is inside the MAC too, so an id minted on one URL means
+// nothing on another.
+//
+// A missing or bad id never refuses a request. The spec allows a server to
+// 400 a request without one, but clients that do not echo the header must
+// keep working, and this is attribution, not access control.
+const SESSION_KEY_LABEL = 'sasonica-shell session-id v1'
+let sessionKeyCache: { from: string; key: string } | null = null
+async function sessionKey(env: Env): Promise<string> {
+  if (sessionKeyCache?.from !== env.SASONICA_HMAC_KEY) {
+    sessionKeyCache = { from: env.SASONICA_HMAC_KEY, key: await hmacHex(env.SASONICA_HMAC_KEY, SESSION_KEY_LABEL) }
+  }
+  return sessionKeyCache.key
+}
+
+function b64urlEncode(text: string): string {
+  const bytes = new TextEncoder().encode(text)
+  let bin = ''
+  for (const b of bytes) bin += String.fromCharCode(b)
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+function b64urlDecode(text: string): string | null {
+  if (!/^[A-Za-z0-9_-]*$/.test(text)) return null
+  try {
+    const bin = atob(text.replace(/-/g, '+').replace(/_/g, '/'))
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)))
+  } catch {
+    return null
+  }
+}
+
+export async function mintSessionId(env: Env, client: string, agent: string): Promise<string> {
+  const name = b64urlEncode(agent)
+  const nonce = randomHex(12)
+  const mac = await hmacHex(await sessionKey(env), `${client}\n${name}.${nonce}`)
+  return `${name}.${nonce}.${mac}`
+}
+
+/** The agent name a session id carries, or null if it is absent, malformed or not ours. */
+export async function agentFromSessionId(env: Env, client: string, id: string | null): Promise<string | null> {
+  if (!id || id.length > 400) return null
+  const parts = id.split('.')
+  if (parts.length !== 3 || !/^[0-9a-f]{24}$/.test(parts[1]) || !/^[0-9a-f]{64}$/.test(parts[2])) return null
+  const want = await hmacHex(await sessionKey(env), `${client}\n${parts[0]}.${parts[1]}`)
+  if (!timingSafeEqual(parts[2], want)) return null
+  const name = b64urlDecode(parts[0])
+  return name ? cleanName(name) || null : null
 }
 
 // --- MCP -------------------------------------------------------------------
@@ -329,7 +492,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
     // doing without a Cloudflare credential in the picture.
     case 'status': {
       const { results = [] } = await env.DB.prepare(
-        `SELECT id, status, exit_code, runner, created_at, updated_at,
+        `SELECT id, status, exit_code, runner, client, agent, created_at, updated_at,
                 substr(replace(replace(command, char(10), ' '), char(9), ' '), 1, 50) AS command,
                 substr(replace(output, char(10), ' | '), 1, 70) AS output
          FROM commands ORDER BY id DESC LIMIT ?`,
@@ -351,14 +514,21 @@ function clampWait(env: Env, asked: unknown, fallback: number): number {
 // `background` is scheduling advice, not part of what is signed: it changes
 // WHEN the runner starts the row, never what runs, so a forged flag can at
 // most start a signed command sooner.
-async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean): Promise<{ row: Row; timedOut: boolean }> {
+//
+// The same goes for `client` and `agent`: they say who asked, and are not
+// signed either. The runner never reads them.
+interface Caller {
+  client: string
+  agent: string
+}
+async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean, who: Caller): Promise<{ row: Row; timedOut: boolean }> {
   const nonce = randomHex(16)
   const sig = await hmacHex(env.SASONICA_HMAC_KEY, `${nonce}\n${command}`)
   const ins = await env.DB.prepare(
-    `INSERT INTO commands (command, status, sig, nonce, background, created_at, updated_at)
-     VALUES (?, 'pending', ?, ?, ?, datetime('now'), datetime('now'))`,
+    `INSERT INTO commands (command, status, sig, nonce, background, client, agent, created_at, updated_at)
+     VALUES (?, 'pending', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
   )
-    .bind(command, sig, nonce, background ? 1 : 0)
+    .bind(command, sig, nonce, background ? 1 : 0, who.client, who.agent)
     .run()
   const id = Number(ins.meta.last_row_id)
   const r = await awaitRow(env, id, waitSeconds)
@@ -368,15 +538,16 @@ async function enqueue(env: Env, command: string, waitSeconds: number, backgroun
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url)
-    // The path IS the credential. Constant-time compare, and every miss is a
-    // plain 404 so the endpoint cannot be found by probing.
+    // The path IS the credential: the shared secret, or one of the
+    // per-client ones (clientFor). Every miss is a plain 404, revoked or
+    // unknown alike, so the endpoint cannot be found by probing and a
+    // revoked URL cannot tell that it once worked.
     const parts = url.pathname.split('/').filter(Boolean)
     // The runner's own API, on a fixed path behind a Bearer token. Checked
     // first so it never has to be reachable through the assistant's secret.
     if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
-    if (parts.length !== 2 || parts[1] !== 'mcp' || !env.SASONICA_URL_SECRET || !timingSafeEqual(parts[0], env.SASONICA_URL_SECRET)) {
-      return new Response('not found', { status: 404 })
-    }
+    const client = parts.length === 2 && parts[1] === 'mcp' ? await clientFor(env, parts[0]) : null
+    if (!client) return new Response('not found', { status: 404 })
     if (request.method !== 'POST') return new Response('POST JSON-RPC here', { status: 405 })
 
     let body: any
@@ -389,12 +560,16 @@ export default {
     if (id === undefined || id === null) return new Response(null, { status: 202 }) // a notification
 
     switch (method) {
-      case 'initialize':
-        return rpc(id, {
+      case 'initialize': {
+        const res = rpc(id, {
           protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: { name: 'sasonica-shell', title: 'Sasonica Shell', version: '0.1.0' },
         })
+        const agent = agentFromInitialize(params) ?? agentFromUserAgent(request)
+        if (agent) res.headers.set('Mcp-Session-Id', await mintSessionId(env, client, agent))
+        return res
+      }
       case 'ping':
         return rpc(id, {})
       case 'tools/list':
@@ -407,7 +582,11 @@ export default {
           if (!command.trim()) return toolText(id, 'run_command needs a command.', true)
           if (command.length > MAX_COMMAND_CHARS) return toolText(id, `Command is ${command.length} characters; the limit is ${MAX_COMMAND_CHARS}.`, true)
           const wait = clampWait(env, args.wait, Number(env.SASONICA_WAIT_DEFAULT ?? 30))
-          const r = await enqueue(env, command, wait, args.background === true)
+          // The session id's name if it verifies, else what the User-Agent
+          // says, else nothing to go on.
+          const agent = (await agentFromSessionId(env, client, request.headers.get('mcp-session-id')))
+            ?? agentFromUserAgent(request) ?? 'unknown'
+          const r = await enqueue(env, command, wait, args.background === true, { client, agent })
           return toolText(id, render(r.row, r.timedOut), !r.timedOut && FAILED.includes(r.row.status))
         }
         if (name === 'cancel') {
