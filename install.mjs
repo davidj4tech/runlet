@@ -370,4 +370,4 @@ console.log(`    There: Add custom connector -> paste the URL -> no authenticati
     Status:      sasonica status        (sasonica --help for the rest)
     Skills:      link SKILL.md files into ${path.join(CONF, 'skills')} for assistants to find
     Config:      ${ENV_FILE}   (runner token, URL secret)   ${KEY_FILE}
-    Re-run the installer any time; it keeps existing keys and ids.`);
+    Re-run the installer any time (sasonica install); it keeps existing keys and ids.`);

@@ -210,6 +210,25 @@ const cases = {
     assert.match(norm(db.row(1).output), /cancelled after it had started/);
   },
 
+  // Every command is told where the runner is, as $SASONICA, so `"$SASONICA"
+  // skills` works where ~/.local/bin is not on the login shell's PATH -- the
+  // promise the run_command description makes. The bash runner exported it;
+  // the port to Node dropped it without anyone noticing, which is why this is
+  // pinned now.
+  async sasonicaVarPointsAtRunner() {
+    setup();
+    const cmd = WIN
+      ? 'Write-Output $env:SASONICA; & $env:SASONICA --help | Select-Object -First 1'
+      : 'printf "%s\\n" "$SASONICA"; "$SASONICA" --help | head -1';
+    const db = await start([job(cmd)]);
+    assert.equal(db.row(1).status, 'done', db.row(1).output);
+    const [where, help] = norm(db.row(1).output).split('\n');
+    // In the state directory, never the config one, and runnable by name.
+    assert.ok(where.startsWith(path.join(TMP, 'state', 'sasonica')), `$SASONICA is ${where}`);
+    assert.match(readFileSync(where, 'utf8'), /sasonica\.mjs/);
+    assert.match(help ?? '', /^sasonica: /, `"$SASONICA" --help did not run: ${db.row(1).output}`);
+  },
+
   // A row whose signature does not verify is rejected and never executed.
   async badSignature() {
     setup();
@@ -411,7 +430,7 @@ const cases = {
     const env = { ...process.env, SASONICA_CONF: empty, HOME: empty, USERPROFILE: empty };
     delete env.SASONICA_KEY;
     const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
-    for (const expected of ['sasonica skills', 'sasonica status', 'SASONICA_WORKER_URL']) {
+    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica install', 'SASONICA_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
     rmSync(empty, { recursive: true, force: true });
@@ -455,6 +474,29 @@ const cliCases = {
         { env: { ...process.env, SASONICA_KEY: v.key }, encoding: 'utf8' }).trim();
       assert.equal(got, t.expected, `vector ${t.name}`);
     }
+  },
+
+  // `sasonica install` is install.mjs under the command a person already has.
+  // --print-url is the one path through it that touches nothing, so it shows
+  // the hand-over (arguments included) without provisioning anything; and a
+  // piece of the umbrella that does not exist yet is refused, not quietly
+  // turned into a shell install.
+  installHandsOver() {
+    const tmp = mkdtempSync(path.join(tmpdir(), 'sasonica-install-'));
+    writeFileSync(path.join(tmp, 'env'),
+      'SASONICA_WORKER_URL=https://w.example\nSASONICA_URL_SECRET=one-two-three-four\n');
+    const env = { ...process.env, SASONICA_CONF: tmp };
+    for (const argv of [['install', '--print-url'], ['install', 'shell', '--print-url']]) {
+      const out = execFileSync(process.execPath, [RUNNER, ...argv], { env, encoding: 'utf8' });
+      assert.equal(out.trim(), 'https://w.example/one-two-three-four/mcp', argv.join(' '));
+    }
+    let refused = null;
+    try { execFileSync(process.execPath, [RUNNER, 'install', 'link'], { env, stdio: 'pipe' }); }
+    catch (e) { refused = e; }
+    assert.ok(refused, '`sasonica install link` should refuse: there is no link installer yet');
+    assert.equal(refused.status, 2);
+    assert.match(String(refused.stderr), /only the shell exists/);
+    rmSync(tmp, { recursive: true, force: true });
   },
 
   skillsListing() {

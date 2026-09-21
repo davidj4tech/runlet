@@ -17,19 +17,25 @@
 //         sasonica status [n]    the last n rows (default 10), newest first
 //         sasonica skills        the skills listed in SASONICA_SKILLS_DIR
 //         sasonica sign <nonce> <command>
+//         sasonica install [shell] [--no-service|--print-url]
+//                                hand over to install.mjs beside this file
 //
 // Every tunable is re-read from the env file each poll, so editing it is live
 // within one interval and needs no restart.
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, readdirSync,
          realpathSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'node:fs';
 import { homedir, hostname, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { renderShim } from './lib/install-lib.mjs';
 
 const WIN = process.platform === 'win32';
+// This file, for `sasonica install` (install.mjs sits beside it) and for the
+// $SASONICA every command is given.
+const SELF = fileURLToPath(import.meta.url);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (m) => console.error(`${new Date().toISOString()} sasonica: ${m}`);
 
@@ -145,6 +151,8 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
   sasonica --once        one poll, then exit
   sasonica               poll forever (what the service runs)
   sasonica sign <nonce> <command>   the signature this runner expects
+  sasonica install [shell] [--no-service|--print-url]
+                         set up or repair this machine (install.mjs)
 
 Config: ${ENV_FILE}
   SASONICA_WORKER_URL     this machine's Worker
@@ -172,6 +180,25 @@ if (sub === 'sign') {
   // spaces are part of the signed text, and argv has already split nothing.
   console.log(hmac(rest[0], rest[1] ?? ''));
   process.exit(0);
+}
+
+// `sasonica install`: the umbrella's installer entry (docs/umbrella.md). Only
+// the shell exists to install today, so `install` and `install shell` are the
+// same thing, and both are install.mjs beside this file -- the command a
+// person already has, rather than a path into the checkout they have to
+// remember. The other pieces the umbrella sketches (link, pair) are refused
+// by name rather than silently installing the shell instead.
+if (sub === 'install') {
+  const args = rest[0] === 'shell' ? rest.slice(1) : rest;
+  if (args[0] && !args[0].startsWith('-')) {
+    console.error(`sasonica install: '${args[0]}' is not something this can install yet; `
+      + 'only the shell exists (sasonica install [shell])');
+    process.exit(2);
+  }
+  const installer = path.join(path.dirname(SELF), 'install.mjs');
+  const r = spawnSync(process.execPath, [installer, ...args], { stdio: 'inherit' });
+  if (r.error) { console.error(`sasonica install: ${r.error.message}`); process.exit(1); }
+  process.exit(r.status ?? 1);
 }
 
 if (sub === 'skills') {
@@ -276,6 +303,25 @@ const writeResult = (id, status, code, output) =>
 // that killTree's process.kill(-pid) needs. On Windows nothing is needed:
 // taskkill /T walks the parent-child tree by pid, which a bare kill misses.
 const SHELL = WIN ? (cfg.SASONICA_SHELL || 'powershell.exe') : '/bin/bash';
+// Every command is told where this runner is, as $SASONICA, so an assistant
+// can run `"$SASONICA" skills` on a machine whose login shell does not have
+// ~/.local/bin on PATH. It points at a shim naming the very node that is
+// running now, written into the state directory on first use. Not this file
+// and its `env node` shebang: `bash -lc` rebuilds PATH from the login
+// profile, and under fnm or nvm that PATH may have no node on it at all --
+// which is how the first attempt at this failed its own test. Not the
+// installer's shim either, which a runner started by hand may not have.
+let SHIM_CACHE = null;
+function sasonicaShim() {
+  if (SHIM_CACHE) return SHIM_CACHE;
+  const file = path.join(STATE_DIR, 'bin', WIN ? 'sasonica.cmd' : 'sasonica');
+  mkdirSync(path.dirname(file), { recursive: true });
+  // rm first, as the installer does: writing through a symlink someone left
+  // here would rewrite whatever it points at.
+  try { unlinkSync(file); } catch { /* not there */ }
+  writeFileSync(file, renderShim({ node: process.execPath, runner: SELF, win: WIN }), { mode: 0o755 });
+  return (SHIM_CACHE = file);
+}
 const shellArgs = (command) => WIN
   ? ['-NoLogo', '-NonInteractive', '-NoProfile', '-Command', command]
   : ['-lc', command];
@@ -363,6 +409,7 @@ function executeAndWatch(id, command) {
   try {
     child = spawn(SHELL, shellArgs(command), {
       detached: !WIN, windowsHide: true, stdio: ['ignore', fd, fd],
+      env: { ...process.env, SASONICA: sasonicaShim() },
     });
   } finally { closeSync(fd); }
   live.set(id, child.pid);
