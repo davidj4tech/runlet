@@ -238,6 +238,7 @@ const cases = {
     assert.equal(r.status, 200);
     assert.match(r.text, /^#1 pending/);
     assert.equal(f.row(1).client, 'default');
+    assert.equal(f.row(1).name, null, 'an unnamed URL records no name');
   },
 
   async addedClientWorks() {
@@ -391,6 +392,106 @@ const cases = {
     assert.equal(none.headers.get('mcp-session-id'), null);
   },
 
+  // --- the URL's name ---------------------------------------------------------
+  // /<secret>/<name>/mcp: the same secret, a name that labels the rows. It
+  // still ends in /mcp, which some connector UIs insist on.
+  async namedPathRecordsName() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    const r = await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/desk/mcp` });
+    assert.equal(r.status, 200);
+    assert.deepEqual([f.row(1).client, f.row(1).name], ['default', 'desk']);
+    // Lowercased, as the name is defined after lowercasing.
+    await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/Desk.2_b-c/mcp` });
+    assert.equal(f.row(2).name, 'desk.2_b-c');
+    assert.equal((await mcp(env, URL_SECRET, 'tools/list', {}, { path: `/${URL_SECRET}/desk/mcp` })).status, 200);
+  },
+
+  async queryNameRecorded() {
+    const f = fakeD1([]);
+    await mcp(envFor(f.binding), URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/mcp?as=Phone` });
+    assert.deepEqual([f.row(1).client, f.row(1).name], ['default', 'phone']);
+  },
+
+  async pathNameBeatsQuery() {
+    const f = fakeD1([]);
+    await mcp(envFor(f.binding), URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/desk/mcp?as=phone` });
+    assert.equal(f.row(1).name, 'desk');
+  },
+
+  // A bad name in the path is any other bad path: a plain 404, the same with
+  // a right secret as with a wrong one, and nothing queued.
+  async badPathNameIs404() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    for (const bad of ['has%20space', 'x'.repeat(33), 'caf%C3%A9', 'a%2Fb', 'semi;colon', '~home']) {
+      const r = await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/${bad}/mcp` });
+      assert.equal(r.status, 404, `name '${bad}' should be 404`);
+      assert.equal(r.text, 'not found', 'a bad name must look like any unknown path');
+    }
+    for (const path of [`/${URL_SECRET}/a/b/mcp`, `/${URL_SECRET}/desk`, `/${URL_SECRET}/desk/mcp/x`, '/desk/mcp']) {
+      assert.equal((await mcp(env, URL_SECRET, 'tools/list', {}, { path })).status, 404, `${path} should be 404`);
+    }
+    assert.equal(f.all().length, 0);
+  },
+
+  // A bad ?as= is only ignored: the query was never what decides access.
+  async badQueryNameIgnored() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    for (const bad of ['has%20space', 'x'.repeat(33), '', 'a/b']) {
+      const r = await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path: `/${URL_SECRET}/mcp?as=${bad}` });
+      assert.equal(r.status, 200, `?as=${bad} should be served`);
+    }
+    assert.deepEqual([...new Set(f.all().map((x) => x.name))], [null]);
+  },
+
+  // The name labels; the secret still decides. A per-client secret with a
+  // name is that client, and a revoked or unknown one is a 404 whatever
+  // name it carries.
+  async namedUrlsFollowTheirSecret() {
+    const f = fakeD1([]);
+    f.addClient('chatgpt', 'chatgpt-secret');
+    f.addClient('old-phone', 'old-phone-secret', { revoked: true });
+    const env = envFor(f.binding);
+    await mcp(env, 'chatgpt-secret', 'run_command', { command: 'true', wait: 0 }, { path: '/chatgpt-secret/work/mcp' });
+    assert.deepEqual([f.row(1).client, f.row(1).name], ['chatgpt', 'work']);
+    // A name that happens to be another client's label changes nothing.
+    await mcp(env, 'chatgpt-secret', 'run_command', { command: 'true', wait: 0 }, { path: '/chatgpt-secret/default/mcp' });
+    assert.deepEqual([f.row(2).client, f.row(2).name], ['chatgpt', 'default']);
+    for (const path of ['/old-phone-secret/phone/mcp', '/old-phone-secret/mcp?as=phone', '/nope/desk/mcp']) {
+      const r = await mcp(env, null, 'tools/list', {}, { path });
+      assert.equal(r.status, 404, `${path} should be 404`);
+      assert.equal(r.text, 'not found');
+    }
+  },
+
+  // An id minted under one name does not carry its agent to another name on
+  // the same secret; the same name by path or by ?as= is the same scope.
+  async sessionIdIsBoundToItsName() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    const init = await mcp(env, URL_SECRET, 'initialize', { clientInfo: { name: 'claude-ai' } },
+      { method: 'initialize', path: `/${URL_SECRET}/desk/mcp` });
+    const sid = init.headers.get('mcp-session-id');
+    for (const path of [`/${URL_SECRET}/desk/mcp`, `/${URL_SECRET}/mcp?as=desk`, `/${URL_SECRET}/phone/mcp`, `/${URL_SECRET}/mcp`]) {
+      await mcp(env, URL_SECRET, 'run_command', { command: 'true', wait: 0 }, { path, headers: { 'mcp-session-id': sid } });
+    }
+    assert.deepEqual(f.all().map((x) => `${x.name ?? '-'}:${x.agent}`),
+      ['desk:claude.ai', 'desk:claude.ai', 'phone:unknown', '-:unknown']);
+  },
+
+  // An unnamed URL's session MAC is exactly what it was before names
+  // existed, so the ids connectors hold today survive the deploy.
+  async unnamedSessionIdUnchanged() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    const init = await mcp(env, URL_SECRET, 'initialize', { clientInfo: { name: 'claude-ai' } }, { method: 'initialize' });
+    const [b64, nonce, mac] = init.headers.get('mcp-session-id').split('.');
+    const derived = await mod.hmacHex(env.SASONICA_HMAC_KEY, 'sasonica-shell session-id v1');
+    assert.equal(mac, await mod.hmacHex(derived, `default\n${b64}.${nonce}`));
+  },
+
   // What the runner's status op returns, for `sasonica status`.
   async statusShowsClientAndAgent() {
     const f = fakeD1([]);
@@ -400,6 +501,12 @@ const cases = {
     const r = await call(envFor(f.binding), { op: 'status', limit: 5 });
     assert.equal(r.body.rows[0].client, 'chatgpt');
     assert.equal(r.body.rows[0].agent, 'chatgpt');
+    assert.equal(r.body.rows[0].name, null);
+    await mcp(envFor(f.binding), 'chatgpt-secret', 'run_command', { command: 'true', wait: 0 },
+      { path: '/chatgpt-secret/desk/mcp', headers: { 'user-agent': 'Claude-User' } });
+    const named = await call(envFor(f.binding), { op: 'status', limit: 5 });
+    assert.deepEqual([named.body.rows[0].client, named.body.rows[0].name, named.body.rows[0].agent],
+      ['chatgpt', 'desk', 'claude.ai']);
   },
 
   // The assistants people connect read as people name them; anything else
@@ -414,14 +521,15 @@ const cases = {
 };
 
 // One MCP request. A tools/call unless `method` says otherwise; the client
-// cache is reset first unless the case is testing the cache itself.
-async function mcp(env, secret, nameOrMethod, args = {}, { method, headers = {}, reset = true } = {}) {
+// cache is reset first unless the case is testing the cache itself. `path`
+// replaces /<secret>/mcp, for the named forms.
+async function mcp(env, secret, nameOrMethod, args = {}, { method, headers = {}, reset = true, path } = {}) {
   if (reset) mod.resetClientCache();
   const isCall = !method && !['tools/list', 'initialize', 'ping'].includes(nameOrMethod);
   const body = isCall
     ? { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: nameOrMethod, arguments: args } }
     : { jsonrpc: '2.0', id: 1, method: method ?? nameOrMethod, params: args };
-  const res = await worker.fetch(new Request(`https://w.example/${secret}/mcp`, {
+  const res = await worker.fetch(new Request(`https://w.example${path ?? `/${secret}/mcp`}`, {
     method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body),
   }), env);
   const raw = await res.text();

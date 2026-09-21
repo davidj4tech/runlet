@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS commands (
   cancel     INTEGER NOT NULL DEFAULT 0, -- 1: stop it (the runner kills it)
   runner     TEXT,                       -- which runner claimed it (hostname)
   client     TEXT,                       -- which connector URL queued it (clients.label, or 'default')
+  name       TEXT,                       -- the name that URL carried (/<secret>/<name>/mcp or ?as=), if any
   agent      TEXT,                       -- what the assistant says it is (clientInfo.name, or ua:<User-Agent>)
   nonce      TEXT    NOT NULL UNIQUE,
   created_at TEXT    NOT NULL,
@@ -26,6 +27,7 @@ CREATE INDEX IF NOT EXISTS idx_commands_pending ON commands (id) WHERE status = 
 -- ALTER TABLE commands ADD COLUMN runner TEXT;
 -- ALTER TABLE commands ADD COLUMN client TEXT;
 -- ALTER TABLE commands ADD COLUMN agent TEXT;
+-- ALTER TABLE commands ADD COLUMN name TEXT;
 
 -- One connector URL per assistant, so one can be revoked without rotating
 -- the URL every other assistant holds. Only the sha256 of each path secret

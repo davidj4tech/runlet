@@ -13,9 +13,11 @@
  * ##  runner host. Two things stand in the way:                            ##
  * ##                                                                       ##
  * ##   1. The URL secret. The MCP endpoint is /<SASONICA_URL_SECRET>/mcp   ##
- * ##      (or a per-client secret from the `clients` table), and any other ##
- * ##      path is 404. Treat each URL like a password: it goes into the    ##
- * ##      connector settings of the assistants you trust and nowhere else. ##
+ * ##      (or a per-client secret from the `clients` table), optionally    ##
+ * ##      /<secret>/<name>/mcp, and any other path is 404. The name only   ##
+ * ##      labels rows; the secret alone decides access. Treat each URL     ##
+ * ##      like a password: it goes into the connector settings of the      ##
+ * ##      assistants you trust and nowhere else.                           ##
  * ##   2. HMAC. Every row is signed with SASONICA_HMAC_KEY, held only here    ##
  * ##      and on the runner. Database access alone cannot make the runner ##
  * ##      execute anything.                                                ##
@@ -83,12 +85,16 @@ function timingSafeEqual(a: string, b: string): boolean {
 }
 
 // --- who is asking -----------------------------------------------------------
-// Two answers, recorded side by side on each row, because they are different
-// kinds of fact:
+// Three answers, recorded side by side on each row, because they are
+// different kinds of fact:
 //
 //   client  which connector URL the request came through. The URL is the
 //           credential, so this is the one that means something: revoking
 //           it stops that assistant and no other.
+//   name    the name the URL itself carries, /<secret>/<name>/mcp or
+//           ?as=<name>, chosen by whoever pasted the URL. Several connectors
+//           can share one secret and still be told apart ("desk", "phone").
+//           It decides nothing: the same secret works under any name.
 //   agent   what the assistant says it is (clientInfo.name at initialize,
 //           else its User-Agent). Anyone can claim any name; it is there
 //           so a person reading the rows can tell who did what on a URL
@@ -147,6 +153,39 @@ export async function clientFor(env: Env, secret: string): Promise<string | null
   const hit = await lookupClient(env, await sha256Hex(secret))
   if (hit) return hit.revoked ? null : hit.label
   if (env.SASONICA_URL_SECRET && timingSafeEqual(secret, env.SASONICA_URL_SECRET)) return 'default'
+  return null
+}
+
+// The name slot of a connector URL: [a-z0-9._-]{1,32} after lowercasing, the
+// same alphabet as a client label, or null. Short and plain because it goes
+// into a D1 column, a terminal and the session id's MAC input.
+const URL_NAME_RE = /^[a-z0-9._-]{1,32}$/
+export function urlName(raw: string | null | undefined): string | null {
+  const name = String(raw ?? '').toLowerCase()
+  return URL_NAME_RE.test(name) ? name : null
+}
+
+// Where an MCP request is aimed: the secret, and the name if the URL gives
+// one. The URL must end in /mcp -- some connector UIs refuse one that does
+// not -- so the name sits between the two:
+//
+//     /<secret>/mcp            no name, as always
+//     /<secret>/<name>/mcp     the named form
+//     ...?as=<name>            the same name as a query, on either form
+//
+// A bad name in the path is a 404 like any other bad path, so it says nothing
+// about whether the secret was right. A bad ?as= is only ignored: a query is
+// something a connector UI may add to or mangle, and it was never part of
+// the path that decides access. The path wins when both are given.
+export function mcpTarget(url: URL): { secret: string; name: string | null } | null {
+  const parts = url.pathname.split('/').filter(Boolean)
+  if (parts.at(-1) !== 'mcp') return null
+  const asName = urlName(url.searchParams.get('as'))
+  if (parts.length === 2) return { secret: parts[0], name: asName }
+  if (parts.length === 3) {
+    const name = urlName(parts[1])
+    return name ? { secret: parts[0], name } : null
+  }
   return null
 }
 
@@ -210,8 +249,9 @@ function agentFromUserAgent(request: Request): string | null {
 // key a session id would be a signature over attacker-chosen text: a name
 // shaped like "<nonce>\n<command>" would come back signed as a runnable row.
 // Under a derived key it signs nothing the runner would accept. The URL's
-// client label is inside the MAC too, so an id minted on one URL means
-// nothing on another.
+// client label and its name are inside the MAC too (sessionScope), so an id
+// minted on one URL -- or under one name on the same secret -- means nothing
+// on another, and one connector cannot carry its agent name to another.
 //
 // A missing or bad id never refuses a request. The spec allows a server to
 // 400 a request without one, but clients that do not echo the header must
@@ -241,19 +281,27 @@ function b64urlDecode(text: string): string | null {
   }
 }
 
-export async function mintSessionId(env: Env, client: string, agent: string): Promise<string> {
+// What a session id is bound to: the client label, and the URL's name after a
+// '/'. A label cannot contain '/', so "a/b" is never a bare label; and an
+// unnamed URL's scope is the label alone, exactly as before names existed, so
+// the ids connectors already hold keep verifying across the deploy.
+export function sessionScope(client: string, name: string | null): string {
+  return name ? `${client}/${name}` : client
+}
+
+export async function mintSessionId(env: Env, scope: string, agent: string): Promise<string> {
   const name = b64urlEncode(agent)
   const nonce = randomHex(12)
-  const mac = await hmacHex(await sessionKey(env), `${client}\n${name}.${nonce}`)
+  const mac = await hmacHex(await sessionKey(env), `${scope}\n${name}.${nonce}`)
   return `${name}.${nonce}.${mac}`
 }
 
 /** The agent name a session id carries, or null if it is absent, malformed or not ours. */
-export async function agentFromSessionId(env: Env, client: string, id: string | null): Promise<string | null> {
+export async function agentFromSessionId(env: Env, scope: string, id: string | null): Promise<string | null> {
   if (!id || id.length > 400) return null
   const parts = id.split('.')
   if (parts.length !== 3 || !/^[0-9a-f]{24}$/.test(parts[1]) || !/^[0-9a-f]{64}$/.test(parts[2])) return null
-  const want = await hmacHex(await sessionKey(env), `${client}\n${parts[0]}.${parts[1]}`)
+  const want = await hmacHex(await sessionKey(env), `${scope}\n${parts[0]}.${parts[1]}`)
   if (!timingSafeEqual(parts[2], want)) return null
   const name = b64urlDecode(parts[0])
   return name ? cleanName(name) || null : null
@@ -512,7 +560,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
     // doing without a Cloudflare credential in the picture.
     case 'status': {
       const { results = [] } = await env.DB.prepare(
-        `SELECT id, status, exit_code, runner, client, agent, created_at, updated_at,
+        `SELECT id, status, exit_code, runner, client, name, agent, created_at, updated_at,
                 substr(replace(replace(command, char(10), ' '), char(9), ' '), 1, 50) AS command,
                 substr(replace(output, char(10), ' | '), 1, 70) AS output
          FROM commands ORDER BY id DESC LIMIT ?`,
@@ -535,20 +583,21 @@ function clampWait(env: Env, asked: unknown, fallback: number): number {
 // WHEN the runner starts the row, never what runs, so a forged flag can at
 // most start a signed command sooner.
 //
-// The same goes for `client` and `agent`: they say who asked, and are not
-// signed either. The runner never reads them.
+// The same goes for `client`, `name` and `agent`: they say who asked, and
+// are not signed either. The runner never reads them.
 interface Caller {
   client: string
+  name: string | null
   agent: string
 }
 async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean, who: Caller): Promise<{ row: Row; timedOut: boolean }> {
   const nonce = randomHex(16)
   const sig = await hmacHex(env.SASONICA_HMAC_KEY, `${nonce}\n${command}`)
   const ins = await env.DB.prepare(
-    `INSERT INTO commands (command, status, sig, nonce, background, client, agent, created_at, updated_at)
-     VALUES (?, 'pending', ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+    `INSERT INTO commands (command, status, sig, nonce, background, client, name, agent, created_at, updated_at)
+     VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
   )
-    .bind(command, sig, nonce, background ? 1 : 0, who.client, who.agent)
+    .bind(command, sig, nonce, background ? 1 : 0, who.client, who.name, who.agent)
     .run()
   const id = Number(ins.meta.last_row_id)
   const r = await awaitRow(env, id, waitSeconds)
@@ -566,8 +615,10 @@ export default {
     // The runner's own API, on a fixed path behind a Bearer token. Checked
     // first so it never has to be reachable through the assistant's secret.
     if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
-    const client = parts.length === 2 && parts[1] === 'mcp' ? await clientFor(env, parts[0]) : null
-    if (!client) return new Response('not found', { status: 404 })
+    const target = mcpTarget(url)
+    const client = target ? await clientFor(env, target.secret) : null
+    if (!target || !client) return new Response('not found', { status: 404 })
+    const scope = sessionScope(client, target.name)
     if (request.method !== 'POST') return new Response('POST JSON-RPC here', { status: 405 })
 
     let body: any
@@ -587,7 +638,7 @@ export default {
           serverInfo: { name: 'sasonica-shell', title: 'Sasonica Shell', version: '0.1.0' },
         })
         const agent = agentFromInitialize(params) ?? agentFromUserAgent(request)
-        if (agent) res.headers.set('Mcp-Session-Id', await mintSessionId(env, client, agent))
+        if (agent) res.headers.set('Mcp-Session-Id', await mintSessionId(env, scope, agent))
         return res
       }
       case 'ping':
@@ -604,9 +655,9 @@ export default {
           const wait = clampWait(env, args.wait, Number(env.SASONICA_WAIT_DEFAULT ?? 30))
           // The session id's name if it verifies, else what the User-Agent
           // says, else nothing to go on.
-          const agent = (await agentFromSessionId(env, client, request.headers.get('mcp-session-id')))
+          const agent = (await agentFromSessionId(env, scope, request.headers.get('mcp-session-id')))
             ?? agentFromUserAgent(request) ?? 'unknown'
-          const r = await enqueue(env, command, wait, args.background === true, { client, agent })
+          const r = await enqueue(env, command, wait, args.background === true, { client, name: target.name, agent })
           return toolText(id, render(r.row, r.timedOut), !r.timedOut && FAILED.includes(r.row.status))
         }
         if (name === 'cancel') {

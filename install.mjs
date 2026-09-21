@@ -217,10 +217,12 @@ if (wrangler(['d1', 'execute', dbName, '--remote', '--file', path.join(HERE, 'sc
 // ALTER TABLE is not idempotent in SQLite, so look first.
 const cols = wrangler(['d1', 'execute', dbName, '--remote', '--json', '--command', 'PRAGMA table_info(commands);'],
   { capture: true }).out;
-// client and agent say who queued a row; the clients table they refer to is
-// in schema.sql as CREATE TABLE IF NOT EXISTS, so it arrived with the file.
+// client, name and agent say who queued a row; the clients table they refer
+// to is in schema.sql as CREATE TABLE IF NOT EXISTS, so it arrived with the
+// file. The Worker writes every one of these on each run_command, so they
+// must exist before it is deployed -- which is why this comes first.
 for (const spec of ['background INTEGER NOT NULL DEFAULT 0', 'cancel INTEGER NOT NULL DEFAULT 0', 'runner TEXT',
-                    'client TEXT', 'agent TEXT']) {
+                    'client TEXT', 'agent TEXT', 'name TEXT']) {
   const col = spec.split(' ')[0];
   if (!new RegExp(`"name"\\s*:\\s*"${col}"`).test(cols)) {
     if (wrangler(['d1', 'execute', dbName, '--remote', '--command', `ALTER TABLE commands ADD COLUMN ${spec};`],
