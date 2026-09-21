@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// install.mjs — runlet, from a Cloudflare API token to a running runner, on
-// every platform. install.sh and install.ps1 are bootstraps: they make sure
-// Node exists and hand over to this.
+// install.mjs — Sasonica Shell, from a Cloudflare API token to a running
+// runner, on every platform. install.sh and install.ps1 are bootstraps: they
+// make sure Node exists and hand over to this. Once a machine has the
+// `sasonica` command, `sasonica install` hands over to it the same way.
 //
 //   node install.mjs                 interactive: asks for the token if not in env
 //   node install.mjs --no-service    everything except registering the runner
@@ -41,12 +42,12 @@ const PRINT_URL = args.has('--print-url');
 
 // --- config files ------------------------------------------------------------
 // Windows has no XDG; %APPDATA% is where per-user config belongs there.
-const CONF = process.env.RUNLET_CONF
-  || (WIN && process.env.APPDATA ? path.join(process.env.APPDATA, 'runlet')
-      : path.join(homedir(), '.config', 'runlet'));
+const CONF = process.env.SASONICA_CONF
+  || (WIN && process.env.APPDATA ? path.join(process.env.APPDATA, 'sasonica')
+      : path.join(homedir(), '.config', 'sasonica'));
 const ENV_FILE = path.join(CONF, 'env');
 const KEY_FILE = path.join(CONF, 'relay.key');
-const RUNNER = path.join(HERE, 'runlet.mjs');
+const RUNNER = path.join(HERE, 'sasonica.mjs');
 
 // Written without a BOM: the runner's parser anchors each line at ^\s*KEY=,
 // and a BOM would hide the first key behind three bytes it cannot match.
@@ -132,9 +133,9 @@ const wrangler = (argv, opts = {}) => run(WRANGLER, argv, { cwd: path.join(HERE,
 const existing = readEnvFile(ENV_FILE);
 
 if (PRINT_URL) {
-  const { RUNLET_WORKER_URL: url, RUNLET_URL_SECRET: secret } = existing;
+  const { SASONICA_WORKER_URL: url, SASONICA_URL_SECRET: secret } = existing;
   if (!url || !secret) {
-    console.error(`${ENV_FILE} lacks RUNLET_WORKER_URL or RUNLET_URL_SECRET: run the installer first`);
+    console.error(`${ENV_FILE} lacks SASONICA_WORKER_URL or SASONICA_URL_SECRET: run the installer first`);
     process.exit(1);
   }
   console.log(`${url}/${secret}/mcp`);
@@ -146,10 +147,10 @@ for (const [k, v] of Object.entries(readEnvFile(path.join(HERE, 'install.conf'))
   if (!process.env[k]) process.env[k] = v;
 }
 
-const site = siteName(process.env.RUNLET_SITE || hostname().split('.')[0]);
+const site = siteName(process.env.SASONICA_SITE || hostname().split('.')[0]);
 // A re-run must find the stack it made, even if the machine was renamed.
-const workerName = process.env.RUNLET_WORKER_NAME || existing.RUNLET_WORKER_NAME || `runlet-${site}`;
-const dbName = process.env.RUNLET_DB_NAME || existing.RUNLET_DB_NAME || `runlet-${site}`;
+const workerName = process.env.SASONICA_WORKER_NAME || existing.SASONICA_WORKER_NAME || `sasonica-shell-${site}`;
+const dbName = process.env.SASONICA_DB_NAME || existing.SASONICA_DB_NAME || `sasonica-shell-${site}`;
 
 // --- 1. dependencies -----------------------------------------------------------
 say('Checking dependencies');
@@ -168,7 +169,7 @@ if (!token) {
       1. Sign in at https://dash.cloudflare.com (a free account is enough).
       2. Open https://dash.cloudflare.com/profile/api-tokens
          -> Create Token -> Create Custom Token (Get started).
-      3. Name it runlet and add three permissions, all "Account":
+      3. Name it sasonica and add three permissions, all "Account":
             Workers Scripts   Edit
             D1                Edit
             Account Settings  Read
@@ -243,21 +244,21 @@ if (!existsSync(KEY_FILE) || !readFileSync(KEY_FILE, 'utf8').trim()) {
   writeText(KEY_FILE, `${hex(32)}\n`, 0o600); note('generated relay.key');
 } else note('relay.key exists, keeping it');
 
-let secret = existing.RUNLET_URL_SECRET;
+let secret = existing.SASONICA_URL_SECRET;
 if (secret) note('URL secret exists, keeping it');
 else {
-  secret = urlSecret(Number(process.env.RUNLET_SECRET_WORDS ?? 5), path.join(HERE, 'words.txt'), note);
+  secret = urlSecret(Number(process.env.SASONICA_SECRET_WORDS ?? 5), path.join(HERE, 'words.txt'), note);
   note('generated the URL secret');
 }
 
 // The runner's own credential: a bearer token for this machine's Worker, so
 // the machine that executes commands holds no Cloudflare credential at all.
-let runnerToken = existing.RUNLET_RUNNER_TOKEN;
+let runnerToken = existing.SASONICA_RUNNER_TOKEN;
 if (runnerToken) note('runner token exists, keeping it');
 else { runnerToken = hex(32); note('generated the runner token'); }
 
-for (const [name, value] of [['RUNLET_HMAC_KEY', readFileSync(KEY_FILE, 'utf8').trim()],
-                             ['RUNLET_URL_SECRET', secret], ['RUNLET_RUNNER_TOKEN', runnerToken]]) {
+for (const [name, value] of [['SASONICA_HMAC_KEY', readFileSync(KEY_FILE, 'utf8').trim()],
+                             ['SASONICA_URL_SECRET', secret], ['SASONICA_RUNNER_TOKEN', runnerToken]]) {
   if (wrangler(['secret', 'put', name], { stdin: value, capture: true }).code !== 0) die(`setting ${name} failed`);
 }
 note('Worker secrets set');
@@ -293,10 +294,10 @@ writeText(ENV_FILE, renderEnv({
 }), 0o600);
 mkdirSync(path.join(CONF, 'skills'), { recursive: true });
 
-// `runlet` as a command. rm first: an earlier installer left a SYMLINK here,
+// `sasonica` as a command. rm first: an earlier installer left a SYMLINK here,
 // and writing through one rewrites the file it points at instead of replacing it.
 const binDir = WIN ? path.join(CONF, 'bin') : path.join(homedir(), '.local', 'bin');
-const shim = path.join(binDir, WIN ? 'runlet.cmd' : 'runlet');
+const shim = path.join(binDir, WIN ? 'sasonica.cmd' : 'sasonica');
 rmSync(shim, { force: true });
 writeText(shim, renderShim({ node: NODE, runner: RUNNER, win: WIN }));
 if (!WIN) chmodSync(shim, 0o755);
@@ -319,7 +320,7 @@ let queued = null;
 for (let i = 1; i <= 12; i++) {
   try {
     const r = await fetch(mcp, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(rpc(1, 'run_command', { command: 'echo runlet-ok', wait: 0 })) });
+      body: JSON.stringify(rpc(1, 'run_command', { command: 'echo sasonica-ok', wait: 0 })) });
     if (r.ok) { queued = await r.json(); break; }
   } catch { /* not there yet */ }
   note(`waiting for the deploy to propagate (${i * 5}s)`);
@@ -332,7 +333,7 @@ const once = run(process.execPath, [RUNNER, '--once'], { capture: true });
 for (const line of `${once.out}${once.err}`.trim().split('\n').filter(Boolean)) note(line);
 const got = await (await fetch(mcp, { method: 'POST', headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify(rpc(2, 'get_result', { id: Number(rid), wait: 30 })) })).json();
-if (!/runlet-ok/.test(got.result?.content?.[0]?.text ?? '')) {
+if (!/sasonica-ok/.test(got.result?.content?.[0]?.text ?? '')) {
   die(`smoke test failed; the runner did not produce the result: ${JSON.stringify(got)}`);
 }
 note(`queued #${rid}, ran it, read the output back: OK`);
@@ -366,7 +367,7 @@ note(`Open ${connectors} in a browser (sign in if it asks).`);
 console.log(`    There: Add custom connector -> paste the URL -> no authentication -> save.
     Then ask Claude to run a command, e.g. "run hostname on my machine".
 
-    Status:      runlet status        (runlet --help for the rest)
+    Status:      sasonica status        (sasonica --help for the rest)
     Skills:      link SKILL.md files into ${path.join(CONF, 'skills')} for assistants to find
     Config:      ${ENV_FILE}   (runner token, URL secret)   ${KEY_FILE}
     Re-run the installer any time; it keeps existing keys and ids.`);

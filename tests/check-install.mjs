@@ -15,6 +15,7 @@ import { siteName, urlSecret, readEnvFile, renderEnv, renderShim,
          winShellCommand, needsWindowsShell } from '../lib/install-lib.mjs';
 import { plist } from '../lib/service-macos.mjs';
 import { taskCommand } from '../lib/service-windows.mjs';
+import { UNIT } from '../lib/service-systemd.mjs';
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const WORDS = path.join(ROOT, 'words.txt');
@@ -47,7 +48,7 @@ const cases = {
   },
 
   urlSecretFallsBackToHex() {
-    const tmp = mkdtempSync(path.join(tmpdir(), 'runlet-words-'));
+    const tmp = mkdtempSync(path.join(tmpdir(), 'sasonica-words-'));
     writeFileSync(path.join(tmp, 'short.txt'), 'one\ntwo\n');
     assert.match(urlSecret(5, path.join(tmp, 'short.txt')), /^[0-9a-f]{48}$/);
     assert.match(urlSecret(5, path.join(tmp, 'absent.txt')), /^[0-9a-f]{48}$/);
@@ -58,18 +59,18 @@ const cases = {
   // credential. It reaches its queue through its own Worker instead.
   envFileCarriesNoCloudflareToken() {
     const body = renderEnv({
-      accountId: 'acc', site: 'hpo', workerName: 'runlet-hpo', dbName: 'runlet-hpo',
+      accountId: 'acc', site: 'hpo', workerName: 'sasonica-shell-hpo', dbName: 'sasonica-shell-hpo',
       dbId: 'id', secret: 'a-b-c-d-e', workerUrl: 'https://w.example',
       runnerToken: 'tok', keyFile: '/c/relay.key',
     }, '2026-01-01');
     assert.ok(!/CLOUDFLARE_API_TOKEN/.test(body), 'the Cloudflare token is being written to the machine');
-    assert.match(body, /^RUNLET_RUNNER_TOKEN=tok$/m);
-    assert.match(body, /^RUNLET_WORKER_URL=https:\/\/w\.example$/m);
+    assert.match(body, /^SASONICA_RUNNER_TOKEN=tok$/m);
+    assert.match(body, /^SASONICA_WORKER_URL=https:\/\/w\.example$/m);
   },
 
   // The runner parses the file it writes; hold both to the same regex.
   envFileRoundTripsThroughTheRunnerParser() {
-    const tmp = mkdtempSync(path.join(tmpdir(), 'runlet-env-'));
+    const tmp = mkdtempSync(path.join(tmpdir(), 'sasonica-env-'));
     const f = path.join(tmp, 'env');
     writeFileSync(f, renderEnv({
       accountId: 'acc', site: 's', workerName: 'w', dbName: 'd', dbId: 'i',
@@ -77,30 +78,30 @@ const cases = {
       runnerToken: 'tok', keyFile: '/k',
     }));
     const back = readEnvFile(f);
-    assert.equal(back.RUNLET_URL_SECRET, 'one-two-three-four-five');
-    assert.equal(back.RUNLET_WORKER_URL, 'https://w.example');
+    assert.equal(back.SASONICA_URL_SECRET, 'one-two-three-four-five');
+    assert.equal(back.SASONICA_WORKER_URL, 'https://w.example');
     assert.equal(back.CLOUDFLARE_API_TOKEN, undefined);
     rmSync(tmp, { recursive: true, force: true });
   },
 
   shimRunsTheRunnerAndForwardsArguments() {
-    const posix = renderShim({ node: '/n/node', runner: '/r/runlet.mjs', win: false });
+    const posix = renderShim({ node: '/n/node', runner: '/r/sasonica.mjs', win: false });
     assert.match(posix, /^#!\/bin\/sh$/m);
-    assert.match(posix, /exec "\/n\/node" "\/r\/runlet\.mjs" "\$@"/);
-    const win = renderShim({ node: 'C:\\n\\node.exe', runner: 'C:\\r\\runlet.mjs', win: true });
-    assert.match(win, /"C:\\n\\node\.exe" "C:\\r\\runlet\.mjs" %\*/);
+    assert.match(posix, /exec "\/n\/node" "\/r\/sasonica\.mjs" "\$@"/);
+    const win = renderShim({ node: 'C:\\n\\node.exe', runner: 'C:\\r\\sasonica.mjs', win: true });
+    assert.match(win, /"C:\\n\\node\.exe" "C:\\r\\sasonica\.mjs" %\*/);
   },
 
   // A plist is XML and these paths can hold & and spaces. install.sh used
   // Python's plistlib to escape them; this builds the XML itself.
   plistEscapesPathsAndKeepsTheRunnerFirst() {
     const xml = plist({
-      node: '/opt/node & co/bin/node', runner: '/home/a b/runlet.mjs',
+      node: '/opt/node & co/bin/node', runner: '/home/a b/sasonica.mjs',
       home: '/home/a b', logs: '/home/a b/logs',
     });
     assert.ok(!/ & /.test(xml), 'a bare ampersand would make the plist invalid XML');
     assert.match(xml, /<string>\/opt\/node &amp; co\/bin\/node<\/string>/);
-    assert.match(xml, /<string>\/home\/a b\/runlet\.mjs<\/string>/);
+    assert.match(xml, /<string>\/home\/a b\/sasonica\.mjs<\/string>/);
     assert.match(xml, /<key>KeepAlive<\/key><true\/>/);
     assert.match(xml, /<key>RunAtLoad<\/key><true\/>/);
   },
@@ -109,7 +110,7 @@ const cases = {
   // ErrorRecord blocks, and a nested quote pair was eaten by Windows argument
   // parsing, silently turning { "$_" } into { $_ }.
   windowsTaskCommandStringifiesAndAvoidsNestedQuotes() {
-    const cmd = taskCommand({ node: 'C:\\node.exe', runner: 'C:\\runlet.mjs', logPath: 'C:\\runner.log' });
+    const cmd = taskCommand({ node: 'C:\\node.exe', runner: 'C:\\sasonica.mjs', logPath: 'C:\\runner.log' });
     assert.match(cmd, /ToString\(\)/);
     assert.equal((cmd.match(/"/g) ?? []).length, 0, 'a double quote here is eaten by argument parsing');
     assert.match(cmd, /Out-File -FilePath 'C:\\runner\.log' -Append/);
@@ -123,7 +124,7 @@ const cases = {
     assert.match(sh, /exec node "\$HERE\/install\.mjs" "\$@"/);
     assert.match(ps, /install\.mjs/);
     for (const [name, text] of [['install.sh', sh], ['install.ps1', ps]]) {
-      for (const gone of ['d1/database', 'wrangler deploy', 'RUNLET_URL_SECRET', 'tokens/verify']) {
+      for (const gone of ['d1/database', 'wrangler deploy', 'SASONICA_URL_SECRET', 'tokens/verify']) {
         assert.ok(!text.includes(gone), `${name} still does provisioning: ${gone}`);
       }
     }
@@ -171,6 +172,30 @@ const cases = {
     const guard = src.lastIndexOf('if (accountId) {', call);
     assert.ok(guard > 0 && guard < call, 'the account listing is not behind a check for a known id');
     assert.match(src, /Workers Scripts: Edit and D1:/);
+  },
+
+  // Runlet became Sasonica Shell on 21 Sep 2026, and every name a machine
+  // ends up holding moved with it. A stray old name here would make a fresh
+  // install land beside the old one under the old name -- or, worse, a re-run
+  // on a migrated machine find and reuse the Worker it was meant to leave.
+  namesAreSasonicaShell() {
+    const src = readFileSync(path.join(ROOT, 'install.mjs'), 'utf8');
+    assert.match(src, /`sasonica-shell-\$\{site\}`;\nconst dbName/, 'the default Worker name');
+    assert.match(src, /SASONICA_DB_NAME \|\| `sasonica-shell-\$\{site\}`/, 'the default database name');
+    assert.equal(UNIT, 'sasonica-shell.service');
+    assert.ok(existsSync(path.join(ROOT, UNIT)), `the unit template ${UNIT} is not in the repo`);
+    const xml = plist({ node: '/n', runner: '/r', home: '/h', logs: '/l' });
+    assert.match(xml, /<key>Label<\/key><string>com\.sasonica\.shell<\/string>/);
+    assert.match(readFileSync(path.join(ROOT, 'lib', 'service-windows.mjs'), 'utf8'),
+      /taskName = 'sasonica-shell'/);
+    for (const f of ['install.mjs', 'sasonica.mjs', UNIT, 'lib/install-lib.mjs',
+                     'lib/service-macos.mjs', 'lib/service-systemd.mjs', 'lib/service-windows.mjs',
+                     'worker/src/index.ts', 'worker/wrangler.jsonc.template']) {
+      // Code may mention the old name in a comment that says it is the old
+      // name; it may not USE it. Strip the "called Runlet until" notes first.
+      const text = readFileSync(path.join(ROOT, f), 'utf8').replace(/called Runlet until/gi, '');
+      assert.ok(!/runlet/i.test(text), `${f} still uses the old name`);
+    }
   },
 
   everyServiceManagerIsCovered() {

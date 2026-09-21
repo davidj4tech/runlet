@@ -1,7 +1,7 @@
 # install.conf — copy to install.conf beside install.sh and fill in, so the
 # installer asks nothing. KEEP THIS FILE PRIVATE: the token can create and
 # change Workers and databases in the account. install.sh copies what it
-# needs into ~/.config/runlet/env; delete this file once it has run.
+# needs into ~/.config/sasonica/env; delete this file once it has run.
 
 # The one manual step. Create at https://dash.cloudflare.com/profile/api-tokens
 # -> Create Token -> Custom Token, Account scope:
@@ -12,5 +12,5 @@ CLOUDFLARE_API_TOKEN=
 #CLOUDFLARE_ACCOUNT_ID=
 
 # A short name for this machine. Goes into the Worker and database names
-# (runlet-<site>) so several machines can share one account.
-RUNLET_SITE=
+# (sasonica-shell-<site>) so several machines can share one account.
+SASONICA_SITE=

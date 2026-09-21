@@ -1,5 +1,6 @@
 /**
- * runlet — the smallest relay that works.
+ * Sasonica Shell — the smallest relay that works. (Called Runlet until
+ * 21 Sep 2026.)
  *
  * One MCP server, four tools: run_command queues a shell command for a runner
  * on your machine; get_result fetches it later; detach lets a slow foreground
@@ -11,36 +12,36 @@
  * ##  Whoever can reach this Worker's URL can run arbitrary shell on the   ##
  * ##  runner host. Two things stand in the way:                            ##
  * ##                                                                       ##
- * ##   1. The URL secret. The MCP endpoint is /<RUNLET_URL_SECRET>/mcp, and ##
+ * ##   1. The URL secret. The MCP endpoint is /<SASONICA_URL_SECRET>/mcp, and ##
  * ##      any other path is 404. Treat that URL like a password: it goes   ##
  * ##      into the connector settings of ONE assistant and nowhere else.   ##
- * ##   2. HMAC. Every row is signed with RUNLET_HMAC_KEY, held only here    ##
+ * ##   2. HMAC. Every row is signed with SASONICA_HMAC_KEY, held only here    ##
  * ##      and on the runner. Database access alone cannot make the runner ##
  * ##      execute anything.                                                ##
  * ###########################################################################
  *
  * The signature is byte-for-byte the v1 scheme of tmux-relay's runner
  * (nonce + "\n" + command, HMAC-SHA256 keyed with the ASCII hex key), so
- * runlet.sh and tmux-relay's d1-runner.sh agree; tests/vectors.json in that
+ * sasonica.mjs and tmux-relay's d1-runner.sh agree; tests/vectors.json in that
  * repo pins it.
  */
 
 interface Env {
   DB: D1Database
   /** Hex key shared with the runner (relay.key). Set with `wrangler secret put`. */
-  RUNLET_HMAC_KEY: string
+  SASONICA_HMAC_KEY: string
   /** The path secret. Set with `wrangler secret put`. */
-  RUNLET_URL_SECRET: string
+  SASONICA_URL_SECRET: string
   /**
    * Bearer token a runner presents at /runner. One per machine, so the
    * machine that executes commands holds no Cloudflare credential at all --
    * a D1 API token is account-wide, and would reach every other queue.
    * Absent = the runner API is off, and every request to it is a 404.
    */
-  RUNLET_RUNNER_TOKEN?: string
+  SASONICA_RUNNER_TOKEN?: string
   /** Seconds run_command waits by default / at most. */
-  RUNLET_WAIT_DEFAULT?: string
-  RUNLET_WAIT_MAX?: string
+  SASONICA_WAIT_DEFAULT?: string
+  SASONICA_WAIT_MAX?: string
 }
 
 const PROTOCOL_VERSION = '2025-06-18'
@@ -86,16 +87,16 @@ const TOOLS = [
       'to `wait` seconds for the result. Anything you send here RUNS on a real ' +
       "machine: prefer read-only commands unless the user asked for a change, and " +
       'never run something destructive on a guess.\n\n' +
-      'Start with `runlet skills` (or `"$RUNLET" skills` if runlet is not on ' +
+      'Start with `sasonica skills` (or `"$SASONICA" skills` if sasonica is not on ' +
       'PATH): it lists the tools the owner has set up on this machine ' +
       '(messaging, services, project helpers), each with a file to read before ' +
       'using it. Check it before assuming something is not there. ' +
-      '`runlet --help` shows the rest.\n\n' +
+      '`sasonica --help` shows the rest.\n\n' +
       'How to operate it:\n' +
       '- The result starts with "#<id> <status> exit=<code>" then the output. ' +
       'Status done means it ran; check exit= before trusting the output.\n' +
       '- Commands run ONE AT A TIME in the order queued (unless the host set ' +
-      'RUNLET_PARALLEL), so a long command holds everything behind it -- unless ' +
+      'SASONICA_PARALLEL), so a long command holds everything behind it -- unless ' +
       'you pass background=true, which lets that one run alongside the queue.\n' +
       '- For anything long: pass background=true and a short wait, note the id, ' +
       'and call get_result with a wait when you want the output. Meanwhile other ' +
@@ -230,7 +231,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
   const offered = (request.headers.get('authorization') ?? '').replace(/^Bearer /, '')
   // Same 404 as an unknown path: whether the API exists must not depend on
   // whether the token was right.
-  if (!env.RUNLET_RUNNER_TOKEN || !timingSafeEqual(offered, env.RUNLET_RUNNER_TOKEN)) {
+  if (!env.SASONICA_RUNNER_TOKEN || !timingSafeEqual(offered, env.SASONICA_RUNNER_TOKEN)) {
     return new Response('not found', { status: 404 })
   }
   if (request.method !== 'POST') return new Response('POST JSON here', { status: 405 })
@@ -247,7 +248,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
     //
     // A claimed row is 'running', so a runner must only ask for what it can
     // start this moment -- hence separate counts. `fg` is the serial lane
-    // (0 while it is busy), `bg` what is left under RUNLET_BACKGROUND_MAX.
+    // (0 while it is busy), `bg` what is left under SASONICA_BACKGROUND_MAX.
     // Asking for both in one request is why a poll costs one round trip.
     case 'claim': {
       const fg = Math.min(Math.max(Number(body?.fg) || 0, 0), CLAIM_LIMIT)
@@ -301,8 +302,8 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
     case 'sweep': {
       const orphans = body?.kind === 'orphans'
       const note = orphans
-        ? 'runlet: the runner restarted while this was running; the command may or may not have completed'
-        : 'runlet: ran past the timeout without reporting; the runner may have hung'
+        ? 'sasonica: the runner restarted while this was running; the command may or may not have completed'
+        : 'sasonica: ran past the timeout without reporting; the runner may have hung'
       const sql = `UPDATE commands SET status = 'error', exit_code = -1, output = ?,
                      updated_at = datetime('now')
                    WHERE status = 'running' AND ` + (orphans
@@ -324,7 +325,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
       return runnerJson({ changed: meta?.changes ?? 0 })
     }
 
-    // Backs `runlet status`, so the owner can ask a machine what it has been
+    // Backs `sasonica status`, so the owner can ask a machine what it has been
     // doing without a Cloudflare credential in the picture.
     case 'status': {
       const { results = [] } = await env.DB.prepare(
@@ -342,7 +343,7 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
 }
 
 function clampWait(env: Env, asked: unknown, fallback: number): number {
-  const max = Number(env.RUNLET_WAIT_MAX ?? WAIT_MAX)
+  const max = Number(env.SASONICA_WAIT_MAX ?? WAIT_MAX)
   const n = Number(asked ?? fallback)
   return Math.min(Math.max(Number.isFinite(n) ? n : fallback, 0), max)
 }
@@ -352,7 +353,7 @@ function clampWait(env: Env, asked: unknown, fallback: number): number {
 // most start a signed command sooner.
 async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean): Promise<{ row: Row; timedOut: boolean }> {
   const nonce = randomHex(16)
-  const sig = await hmacHex(env.RUNLET_HMAC_KEY, `${nonce}\n${command}`)
+  const sig = await hmacHex(env.SASONICA_HMAC_KEY, `${nonce}\n${command}`)
   const ins = await env.DB.prepare(
     `INSERT INTO commands (command, status, sig, nonce, background, created_at, updated_at)
      VALUES (?, 'pending', ?, ?, ?, datetime('now'), datetime('now'))`,
@@ -373,7 +374,7 @@ export default {
     // The runner's own API, on a fixed path behind a Bearer token. Checked
     // first so it never has to be reachable through the assistant's secret.
     if (parts.length === 1 && parts[0] === 'runner') return runnerApi(request, env)
-    if (parts.length !== 2 || parts[1] !== 'mcp' || !env.RUNLET_URL_SECRET || !timingSafeEqual(parts[0], env.RUNLET_URL_SECRET)) {
+    if (parts.length !== 2 || parts[1] !== 'mcp' || !env.SASONICA_URL_SECRET || !timingSafeEqual(parts[0], env.SASONICA_URL_SECRET)) {
       return new Response('not found', { status: 404 })
     }
     if (request.method !== 'POST') return new Response('POST JSON-RPC here', { status: 405 })
@@ -392,7 +393,7 @@ export default {
         return rpc(id, {
           protocolVersion: typeof params?.protocolVersion === 'string' ? params.protocolVersion : PROTOCOL_VERSION,
           capabilities: { tools: {} },
-          serverInfo: { name: 'runlet', version: '0.1.0' },
+          serverInfo: { name: 'sasonica-shell', title: 'Sasonica Shell', version: '0.1.0' },
         })
       case 'ping':
         return rpc(id, {})
@@ -405,7 +406,7 @@ export default {
           const command = String(args.command ?? '')
           if (!command.trim()) return toolText(id, 'run_command needs a command.', true)
           if (command.length > MAX_COMMAND_CHARS) return toolText(id, `Command is ${command.length} characters; the limit is ${MAX_COMMAND_CHARS}.`, true)
-          const wait = clampWait(env, args.wait, Number(env.RUNLET_WAIT_DEFAULT ?? 30))
+          const wait = clampWait(env, args.wait, Number(env.SASONICA_WAIT_DEFAULT ?? 30))
           const r = await enqueue(env, command, wait, args.background === true)
           return toolText(id, render(r.row, r.timedOut), !r.timedOut && FAILED.includes(r.row.status))
         }
@@ -418,7 +419,7 @@ export default {
           // Still queued: it never starts. The runner claims only 'pending'
           // rows, so flipping the status here is enough and needs no runner.
           const q = await env.DB.prepare(
-            `UPDATE commands SET status = 'cancelled', exit_code = -1, output = 'runlet: cancelled before it started', updated_at = datetime('now')
+            `UPDATE commands SET status = 'cancelled', exit_code = -1, output = 'sasonica: cancelled before it started', updated_at = datetime('now')
               WHERE id = ? AND status = 'pending'`,
           ).bind(rid).run()
           if (q.meta.changes === 1) return toolText(id, `#${rid} cancelled before it started.`)

@@ -1,4 +1,4 @@
-// runlet — wrangler config. install.sh fills in the two ids and writes
+// Sasonica Shell — wrangler config. install.mjs fills in the two ids and writes
 // wrangler.jsonc next to this file; do not edit the template by hand.
 {
   "$schema": "node_modules/wrangler/config-schema.json",
@@ -10,5 +10,5 @@
   "d1_databases": [
     { "binding": "DB", "database_name": "__DB_NAME__", "database_id": "__DB_ID__" }
   ],
-  "vars": { "RUNLET_WAIT_DEFAULT": "30", "RUNLET_WAIT_MAX": "30" }
+  "vars": { "SASONICA_WAIT_DEFAULT": "30", "SASONICA_WAIT_MAX": "30" }
 }

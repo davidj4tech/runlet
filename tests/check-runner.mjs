@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// check-runner.mjs — runlet.mjs, the runner on every platform, driven against
+// check-runner.mjs — sasonica.mjs, the runner on every platform, driven against
 // the real Worker over real SQLite.
 //
 //     node tests/check-runner.mjs            every case
 //     node tests/check-runner.mjs <name>     one case, in this process
 //
-// runlet.mjs reads its config once at module load, so each case runs in
+// sasonica.mjs reads its config once at module load, so each case runs in
 // its own process. Cases marked `loop:` start the polling loop rather than
 // --once, and assert while it runs; the rest use --once and assert after.
 import { spawn, execFileSync } from 'node:child_process';
@@ -24,7 +24,7 @@ const worker = (await import('../worker/src/index.ts')).default;
 const RUNNER_TOKEN = 'runner-token-under-test';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const RUNNER = path.join(HERE, '..', 'runlet.mjs');
+const RUNNER = path.join(HERE, '..', 'sasonica.mjs');
 const KEY = 'ab'.repeat(32);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const WIN = process.platform === 'win32';
@@ -55,7 +55,7 @@ const norm = (s) => (s ?? '').replace(/\r\n/g, '\n');
 let TMP, MARKER, logs = [];
 
 function setup(envLines = {}, ambient = {}) {
-  TMP = mkdtempSync(path.join(tmpdir(), 'runlet-win-'));
+  TMP = mkdtempSync(path.join(tmpdir(), 'sasonica-win-'));
   process.on('exit', () => rmSync(TMP, { recursive: true, force: true }));
   MARKER = path.join(TMP, 'marker');
   const conf = path.join(TMP, 'conf');
@@ -64,12 +64,12 @@ function setup(envLines = {}, ambient = {}) {
   writeFileSync(path.join(conf, 'env'),
     Object.entries(envLines).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
   Object.assign(process.env, {
-    RUNLET_CONF: conf,
+    SASONICA_CONF: conf,
     XDG_STATE_HOME: path.join(TMP, 'state'),
-    RUNLET_WORKER_URL: 'https://worker.test',
-    RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
-    RUNLET_RUNNER_ID: 'testrunner',
-    RUNLET_DETACH_CHECK: '1',
+    SASONICA_WORKER_URL: 'https://worker.test',
+    SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
+    SASONICA_RUNNER_ID: 'testrunner',
+    SASONICA_DETACH_CHECK: '1',
     ...ambient,
   });
   // The runner logs through console.error; keep it for assertions and out of
@@ -77,7 +77,7 @@ function setup(envLines = {}, ambient = {}) {
   const real = console.error;
   console.error = (...a) => logs.push(a.join(' '));
   process.on('exit', () => { console.error = real; });
-  return { conf, nonces: path.join(TMP, 'state', 'runlet', 'nonces') };
+  return { conf, nonces: path.join(TMP, 'state', 'sasonica', 'nonces') };
 }
 
 const job = (command, extra = {}) => {
@@ -89,8 +89,8 @@ const job = (command, extra = {}) => {
 async function start(rows, mode = '--once') {
   const db = fakeD1(rows);
   const env = {
-    DB: db.binding, RUNLET_HMAC_KEY: KEY,
-    RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+    DB: db.binding, SASONICA_HMAC_KEY: KEY,
+    SASONICA_URL_SECRET: 'unused-here', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
   };
   globalThis.fetch = (url, init) => worker.fetch(new Request(url, init), env);
   process.argv = [process.argv[0], RUNNER, ...(mode === '--once' ? ['--once'] : [])];
@@ -115,8 +115,8 @@ const logged = (re) => logs.some((l) => re.test(l));
 async function serveWorker(rows) {
   const db = fakeD1(rows);
   const env = {
-    DB: db.binding, RUNLET_HMAC_KEY: KEY,
-    RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+    DB: db.binding, SASONICA_HMAC_KEY: KEY,
+    SASONICA_URL_SECRET: 'unused-here', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
   };
   const server = createServer(async (req, res) => {
     const chunks = [];
@@ -138,10 +138,10 @@ async function serveWorker(rows) {
 function spawnRunner(url, conf, extra = {}) {
   const child = spawn(process.execPath, [RUNNER], {
     env: {
-      ...process.env, RUNLET_CONF: conf, RUNLET_WORKER_URL: url,
-      RUNLET_RUNNER_TOKEN: RUNNER_TOKEN, RUNLET_RUNNER_ID: 'testrunner',
-      XDG_STATE_HOME: path.join(TMP, 'state'), RUNLET_POLL: '1',
-      RUNLET_DETACH_CHECK: '1', RUNLET_CMD_TIMEOUT: '120', ...extra,
+      ...process.env, SASONICA_CONF: conf, SASONICA_WORKER_URL: url,
+      SASONICA_RUNNER_TOKEN: RUNNER_TOKEN, SASONICA_RUNNER_ID: 'testrunner',
+      XDG_STATE_HOME: path.join(TMP, 'state'), SASONICA_POLL: '1',
+      SASONICA_DETACH_CHECK: '1', SASONICA_CMD_TIMEOUT: '120', ...extra,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -161,7 +161,7 @@ const grandchildJob = (marker) =>
 const sizeOf = (f) => { try { return statSync(f).size; } catch { return 0; } };
 
 // The forced kill lands after the grace period (5s for a cancel, as
-// runlet.sh's cancel_job used), so wait for the writing to stop rather than
+// the bash runner's cancel_job used), so wait for the writing to stop rather than
 // assume how long it takes.
 async function stopsGrowing(file, ms = 14000) {
   const end = Date.now() + ms;
@@ -189,10 +189,10 @@ const cases = {
   },
 
   async timeout() {
-    setup({ RUNLET_CMD_TIMEOUT: 2 });
+    setup({ SASONICA_CMD_TIMEOUT: 2 });
     const db = await start([job(C.startThenSleep(30))]);
     assert.equal(db.row(1).status, 'timeout');
-    // 124 is what `timeout` gives runlet.sh; both runners must agree.
+    // 124 is what `timeout` gave the bash runner; the port must agree.
     assert.equal(db.row(1).exit_code, 124);
     assert.match(norm(db.row(1).output), /starting/);
     assert.match(norm(db.row(1).output), /killed after 2s/);
@@ -200,7 +200,7 @@ const cases = {
 
   // A cancel reaches the job once it is up, and the partial output survives.
   async loopCancel() {
-    setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
+    setup({ SASONICA_POLL: 1, SASONICA_CMD_TIMEOUT: 60 });
     const db = await start([job(C.startThenSleep(30))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     db.set(1, 'cancel', 1);
@@ -230,18 +230,18 @@ const cases = {
     assert.equal(existsSync(MARKER), false, 'a replayed command must not run');
   },
 
-  // runlet.sh does `set -a; . env`, so the env FILE wins over the ambient
-  // environment. A 2 s timeout in the file must beat a 60 s one in the env.
+  // The bash runner did `set -a; . env`, so the env FILE wins over the
+  // ambient environment. A 2 s timeout in the file must beat a 60 s one in the env.
   async envFileWins() {
-    setup({ RUNLET_CMD_TIMEOUT: 2 }, { RUNLET_CMD_TIMEOUT: '60' });
+    setup({ SASONICA_CMD_TIMEOUT: 2 }, { SASONICA_CMD_TIMEOUT: '60' });
     const started = Date.now();
     const db = await start([job(C.sleep(30))]);
     assert.equal(db.row(1).status, 'timeout');
     assert.ok(Date.now() - started < 20000, 'the file value was not used');
   },
 
-  // Nonces live beside runlet.sh's, under $XDG_STATE_HOME, not in the config
-  // directory: a machine that has run both keeps one replay history.
+  // Nonces live under $XDG_STATE_HOME, where the bash runner kept them, not in
+  // the config directory: state and settings stay apart.
   async stateUnderXdg() {
     const { conf, nonces } = setup();
     const rows = [job(C.noop)];
@@ -261,18 +261,18 @@ const cases = {
     delete process.env.XDG_STATE_HOME;
     Object.assign(process.env, { HOME: home, USERPROFILE: home, LOCALAPPDATA: home });
     const expected = WIN
-      ? path.join(home, 'runlet', 'nonces')
-      : path.join(home, '.local', 'state', 'runlet', 'nonces');
+      ? path.join(home, 'sasonica', 'nonces')
+      : path.join(home, '.local', 'state', 'sasonica', 'nonces');
     const rows = [job(C.noop)];
     await start(rows);
     assert.ok(existsSync(expected), `no nonce file at ${expected}`);
     assert.match(readFileSync(expected, 'utf8'), new RegExp(rows[0].nonce));
   },
 
-  // RUNLET_NONCE_FILE relocates it, as it does for runlet.sh.
+  // SASONICA_NONCE_FILE relocates it, as the bash runner's did.
   async nonceFileOverride() {
-    const custom = path.join(mkdtempSync(path.join(tmpdir(), 'runlet-nonce-')), 'deep', 'n');
-    setup({}, { RUNLET_NONCE_FILE: custom });
+    const custom = path.join(mkdtempSync(path.join(tmpdir(), 'sasonica-nonce-')), 'deep', 'n');
+    setup({}, { SASONICA_NONCE_FILE: custom });
     const rows = [job(C.noop)];
     await start(rows);
     assert.match(readFileSync(custom, 'utf8'), new RegExp(rows[0].nonce));
@@ -289,10 +289,10 @@ const cases = {
     assert.ok(lines.length >= 5000, `trimmed too far: ${lines.length} lines`);
   },
 
-  // runlet.sh keeps the FIRST RUNLET_MAX_OUTPUT bytes (head -c): the start of
+  // The runner keeps the FIRST SASONICA_MAX_OUTPUT bytes (head -c): the start of
   // a failing command's output is the part that says why.
   async outputIsHeadNotTail() {
-    setup({ RUNLET_MAX_OUTPUT: 20 });
+    setup({ SASONICA_MAX_OUTPUT: 20 });
     const db = await start([job(C.tenAsHundredBs)]);
     assert.equal(db.row(1).output.length, 20);
     assert.match(db.row(1).output, /^AAAAAAAAAA/);
@@ -301,7 +301,7 @@ const cases = {
   // A long foreground job must not block the poll loop: a background row
   // queued behind it still starts, and a second foreground row still waits.
   async loopLaneDoesNotBlock() {
-    setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
+    setup({ SASONICA_POLL: 1, SASONICA_CMD_TIMEOUT: 60 });
     const db = await start([job(C.sleep(25))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     db.add({ ...job(C.sleep(5)), background: 1 });
@@ -315,7 +315,7 @@ const cases = {
 
   // Detaching frees the lane; the job is still watched to its result.
   async loopDetach() {
-    setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 60 });
+    setup({ SASONICA_POLL: 1, SASONICA_CMD_TIMEOUT: 60 });
     const db = await start([job(C.sleep(6))], 'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     db.set(1, 'background', 1);                     // run_command --detach
@@ -327,32 +327,32 @@ const cases = {
       'the detached job never wrote its result');
   },
 
-  // RUNLET_BACKGROUND_MAX caps background rows however many are queued.
+  // SASONICA_BACKGROUND_MAX caps background rows however many are queued.
   async loopBackgroundMax() {
-    setup({ RUNLET_POLL: 1, RUNLET_BACKGROUND_MAX: 1, RUNLET_CMD_TIMEOUT: 60 });
+    setup({ SASONICA_POLL: 1, SASONICA_BACKGROUND_MAX: 1, SASONICA_CMD_TIMEOUT: 60 });
     const db = await start([job(C.sleep(4), { background: 1 }), job(C.sleep(1), { background: 1 })],
       'loop');
     assert.ok(await until(() => db.row(1).status === 'running'), 'row 1 never started');
     await sleep(1500);
-    assert.equal(db.row(2).status, 'pending', 'RUNLET_BACKGROUND_MAX was not honoured');
+    assert.equal(db.row(2).status, 'pending', 'SASONICA_BACKGROUND_MAX was not honoured');
     assert.ok(await until(() => db.row(2).status === 'done', 20000),
       'the second background row never ran');
   },
 
-  // Editing the env file is live within one poll, as it is for runlet.sh.
+  // Editing the env file is live within one poll.
   async loopReloadTunables() {
-    const { conf } = setup({ RUNLET_POLL: 1, RUNLET_CMD_TIMEOUT: 600 });
+    const { conf } = setup({ SASONICA_POLL: 1, SASONICA_CMD_TIMEOUT: 600 });
     await start([], 'loop');
     await sleep(1200);
-    writeFileSync(path.join(conf, 'env'), 'RUNLET_POLL=1\nRUNLET_CMD_TIMEOUT=5\n');
-    assert.ok(await until(() => logged(/RUNLET_CMD_TIMEOUT now 5s \(was 600s\)/)),
+    writeFileSync(path.join(conf, 'env'), 'SASONICA_POLL=1\nSASONICA_CMD_TIMEOUT=5\n');
+    assert.ok(await until(() => logged(/SASONICA_CMD_TIMEOUT now 5s \(was 600s\)/)),
       'the env file was not re-read');
   },
 
   // A row left 'running' by a runner that died is swept at startup, or a
   // waiting get_result can only ever time out.
   async loopSweepsOrphans() {
-    setup({ RUNLET_POLL: 1 });
+    setup({ SASONICA_POLL: 1 });
     const db = await start([{ ...job(C.noop), status: 'running', runner: 'testrunner' }], 'loop');
     assert.ok(await until(() => db.row(1).status === 'error'), 'orphan not swept');
     assert.match(db.row(1).output ?? '', /runner restarted/);
@@ -399,19 +399,19 @@ const cases = {
   // Worker URL would hand it to anyone on the path. Loopback is the exception.
   async refusesPlaintextWorkerUrl() {
     setup();
-    process.env.RUNLET_WORKER_URL = 'http://runlet.example.com';
+    process.env.SASONICA_WORKER_URL = 'http://shell.example.com';
     await assert.rejects(() => import(pathToFileURL(RUNNER).href), /must be https/);
   },
 
-  // `runlet --help` is what an assistant reads to learn the machine's surface,
+  // `sasonica --help` is what an assistant reads to learn the machine's surface,
   // so it has to work before there is any config -- no env file, no
   // relay.key, nothing. A machine that already had one hid this.
   async helpNeedsNoConfig() {
-    const empty = mkdtempSync(path.join(tmpdir(), 'runlet-noconf-'));
-    const env = { ...process.env, RUNLET_CONF: empty, HOME: empty, USERPROFILE: empty };
-    delete env.RUNLET_KEY;
+    const empty = mkdtempSync(path.join(tmpdir(), 'sasonica-noconf-'));
+    const env = { ...process.env, SASONICA_CONF: empty, HOME: empty, USERPROFILE: empty };
+    delete env.SASONICA_KEY;
     const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
-    for (const expected of ['runlet skills', 'runlet status', 'RUNLET_WORKER_URL']) {
+    for (const expected of ['sasonica skills', 'sasonica status', 'SASONICA_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
     rmSync(empty, { recursive: true, force: true });
@@ -425,8 +425,8 @@ const cases = {
       { ...job('echo two'), status: 'running', runner: 'w' },
     ]);
     const env = {
-      DB: db.binding, RUNLET_HMAC_KEY: KEY,
-      RUNLET_URL_SECRET: 'unused-here', RUNLET_RUNNER_TOKEN: RUNNER_TOKEN,
+      DB: db.binding, SASONICA_HMAC_KEY: KEY,
+      SASONICA_URL_SECRET: 'unused-here', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
     };
     globalThis.fetch = (url, init) => worker.fetch(new Request(url, init), env);
     process.argv = [process.argv[0], RUNNER, 'status', '5'];
@@ -452,19 +452,19 @@ const cliCases = {
     for (const t of v.vectors) {
       const cmd = Buffer.from(t.command_b64, 'base64').toString('utf8');
       const got = execFileSync(process.execPath, [RUNNER, 'sign', t.nonce, cmd],
-        { env: { ...process.env, RUNLET_KEY: v.key }, encoding: 'utf8' }).trim();
+        { env: { ...process.env, SASONICA_KEY: v.key }, encoding: 'utf8' }).trim();
       assert.equal(got, t.expected, `vector ${t.name}`);
     }
   },
 
   skillsListing() {
-    const tmp = mkdtempSync(path.join(tmpdir(), 'runlet-skills-'));
-    const env = { ...process.env, RUNLET_CONF: tmp, RUNLET_SKILLS_DIR: path.join(tmp, 'skills'),
-                  RUNLET_KEY: KEY };
+    const tmp = mkdtempSync(path.join(tmpdir(), 'sasonica-skills-'));
+    const env = { ...process.env, SASONICA_CONF: tmp, SASONICA_SKILLS_DIR: path.join(tmp, 'skills'),
+                  SASONICA_KEY: KEY };
     const run = () => execFileSync(process.execPath, [RUNNER, 'skills'], { env, encoding: 'utf8' });
     assert.match(run(), /No skills listed/);
-    mkdirSync(env.RUNLET_SKILLS_DIR);
-    writeFileSync(path.join(env.RUNLET_SKILLS_DIR, 'deploy.md'),
+    mkdirSync(env.SASONICA_SKILLS_DIR);
+    writeFileSync(path.join(env.SASONICA_SKILLS_DIR, 'deploy.md'),
       '---\nname: deploy\ndescription: push the site live\n---\n\nSteps.\n');
     const out = run();
     assert.match(out, /deploy: push the site live/);

@@ -15,8 +15,8 @@ const TOKEN = 'runner-token-under-test';
 const URL_SECRET = 'five-word-url-secret-here';
 
 const envFor = (binding, extra = {}) => ({
-  DB: binding, RUNLET_HMAC_KEY: 'ab'.repeat(32),
-  RUNLET_URL_SECRET: URL_SECRET, RUNLET_RUNNER_TOKEN: TOKEN, ...extra,
+  DB: binding, SASONICA_HMAC_KEY: 'ab'.repeat(32),
+  SASONICA_URL_SECRET: URL_SECRET, SASONICA_RUNNER_TOKEN: TOKEN, ...extra,
 });
 
 const post = (env, body, { token = TOKEN, method = 'POST', path = '/runner' } = {}) =>
@@ -47,7 +47,7 @@ const cases = {
   // No token configured = the runner API is off, not open.
   async disabledWithoutToken() {
     const f = fakeD1([{ command: 'echo hi' }]);
-    const env = envFor(f.binding, { RUNLET_RUNNER_TOKEN: undefined });
+    const env = envFor(f.binding, { SASONICA_RUNNER_TOKEN: undefined });
     assert.equal((await post(env, { op: 'claim', fg: 1 })).status, 404);
     assert.equal(f.row(1).status, 'pending');
   },

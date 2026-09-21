@@ -1,17 +1,22 @@
 #!/usr/bin/env node
-// runlet.mjs — the runner, on every platform. It polls its Worker for signed
-// commands, runs what verifies, and writes the results back.
+// sasonica.mjs — Sasonica Shell's runner, on every platform, and the
+// `sasonica` command. It polls its Worker for signed commands, runs what
+// verifies, and writes the results back.
+//
+// Sasonica Shell was called Runlet until 21 Sep 2026; MIGRATING.md moves an
+// install across.
 //
 //   THIS PROCESS EXECUTES COMMANDS READ FROM A DATABASE, as you.
 //   The HMAC check below is what stops a row that merely got INTO the
 //   database from running: only a row signed with relay.key is executed.
 //
-// Usage:  node runlet.mjs            poll forever (the service form)
-//         node runlet.mjs --help     the above, for a person or an assistant
-//         node runlet.mjs --once     one poll, for testing
-//         node runlet.mjs status [n] the last n rows (default 10), newest first
-//         node runlet.mjs skills     the skills listed in RUNLET_SKILLS_DIR
-//         node runlet.mjs sign <nonce> <command>
+// Usage (the installer puts a `sasonica` shim on PATH that runs this file):
+//         sasonica               poll forever (the service form)
+//         sasonica --help        the above, for a person or an assistant
+//         sasonica --once        one poll, for testing
+//         sasonica status [n]    the last n rows (default 10), newest first
+//         sasonica skills        the skills listed in SASONICA_SKILLS_DIR
+//         sasonica sign <nonce> <command>
 //
 // Every tunable is re-read from the env file each poll, so editing it is live
 // within one interval and needs no restart.
@@ -26,20 +31,21 @@ import path from 'node:path';
 
 const WIN = process.platform === 'win32';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const log = (m) => console.error(`${new Date().toISOString()} runlet: ${m}`);
+const log = (m) => console.error(`${new Date().toISOString()} sasonica: ${m}`);
 
 // --- config -----------------------------------------------------------------
-// Windows has no XDG. Prefer %APPDATA%\runlet, fall back to ~/.config/runlet
-// so a WSL-made config still works if someone migrates across.
-const CONF = process.env.RUNLET_CONF
+// Windows has no XDG. Prefer %APPDATA%\sasonica, fall back to
+// ~/.config/sasonica so a WSL-made config still works if someone migrates
+// across.
+const CONF = process.env.SASONICA_CONF
   || (WIN && process.env.APPDATA
-      ? path.join(process.env.APPDATA, 'runlet')
-      : path.join(homedir(), '.config', 'runlet'));
+      ? path.join(process.env.APPDATA, 'sasonica')
+      : path.join(homedir(), '.config', 'sasonica'));
 const ENV_FILE = path.join(CONF, 'env');
 
-// runlet.sh does `set -a; . env`, so the FILE wins over the ambient
-// environment. Spread it last to match; getting this backwards means a stale
-// exported token silently beats the one install.sh wrote.
+// The bash runner this replaced did `set -a; . env`, so the FILE wins over
+// the ambient environment. Spread it last to match; getting this backwards means a stale
+// exported token silently beats the one the installer wrote.
 function loadEnv() {
   const out = {};
   if (!existsSync(ENV_FILE)) return out;
@@ -54,54 +60,54 @@ function loadEnv() {
 // running job is not "on the fly". Only T below is re-read each poll.
 const cfg = { ...process.env, ...loadEnv() };
 
-// Read on first use, not at load: `runlet --help` and `runlet skills` must
+// Read on first use, not at load: `sasonica --help` and `sasonica skills` must
 // work on a machine that has no config yet, and reading the key eagerly made
 // both die with ENOENT on relay.key.
 let KEY_CACHE = null;
-const key = () => (KEY_CACHE ??= (cfg.RUNLET_KEY
-  ?? readFileSync(cfg.RUNLET_KEY_FILE || path.join(CONF, 'relay.key'), 'utf8')).replace(/\s+/g, ''));
-const RUNNER_ID = cfg.RUNLET_RUNNER_ID || hostname().split('.')[0];
-const MAX_OUTPUT = Number(cfg.RUNLET_MAX_OUTPUT ?? 60000);
+const key = () => (KEY_CACHE ??= (cfg.SASONICA_KEY
+  ?? readFileSync(cfg.SASONICA_KEY_FILE || path.join(CONF, 'relay.key'), 'utf8')).replace(/\s+/g, ''));
+const RUNNER_ID = cfg.SASONICA_RUNNER_ID || hostname().split('.')[0];
+const MAX_OUTPUT = Number(cfg.SASONICA_MAX_OUTPUT ?? 60000);
 
-// State, not config: the same split runlet.sh makes, so a machine that has
-// run both keeps one nonce history. %LOCALAPPDATA% is the Windows
+// State, not config: the same split the bash runner made, so the replay
+// history never mixes with the settings. %LOCALAPPDATA% is the Windows
 // $XDG_STATE_HOME — data that belongs to this machine and is not roamed.
 const STATE_HOME = process.env.XDG_STATE_HOME
   || (WIN && process.env.LOCALAPPDATA ? process.env.LOCALAPPDATA
       : path.join(homedir(), '.local', 'state'));
-const STATE_DIR = path.join(STATE_HOME, 'runlet');
-const SEEN = cfg.RUNLET_NONCE_FILE || path.join(STATE_DIR, 'nonces');
+const STATE_DIR = path.join(STATE_HOME, 'sasonica');
+const SEEN = cfg.SASONICA_NONCE_FILE || path.join(STATE_DIR, 'nonces');
 mkdirSync(STATE_DIR, { recursive: true });
 mkdirSync(path.dirname(SEEN), { recursive: true });
 
-// Validated exactly as runlet.sh validates them: a junk value falls back to
+// Validated exactly as the bash runner validated them: a junk value falls back to
 // the default rather than disabling the limit it describes.
 const num = (v, re, dflt) => (re.test(String(v ?? '')) ? Number(v) : dflt);
 const POS = /^[1-9][0-9]*$/, NAT = /^[0-9]+$/, DEC = /^[0-9]+(\.[0-9]+)?$/;
-const DETACH_CHECK = num(cfg.RUNLET_DETACH_CHECK, POS, 3) * 1000;   // not reloaded
+const DETACH_CHECK = num(cfg.SASONICA_DETACH_CHECK, POS, 3) * 1000;   // not reloaded
 const T = {
-  PARALLEL:       num(cfg.RUNLET_PARALLEL, POS, 1),
-  BACKGROUND_MAX: num(cfg.RUNLET_BACKGROUND_MAX, POS, 4),
-  CMD_TIMEOUT:    num(cfg.RUNLET_CMD_TIMEOUT, POS, 600),
-  POLL:           num(cfg.RUNLET_POLL, POS, 5),
-  PROGRESS_EVERY: num(cfg.RUNLET_PROGRESS_EVERY, NAT, 10),
-  KEEP_DAYS:      num(cfg.RUNLET_KEEP_DAYS, POS, 30),
-  LOAD_MAX:       num(cfg.RUNLET_LOAD_MAX, DEC, 0),
+  PARALLEL:       num(cfg.SASONICA_PARALLEL, POS, 1),
+  BACKGROUND_MAX: num(cfg.SASONICA_BACKGROUND_MAX, POS, 4),
+  CMD_TIMEOUT:    num(cfg.SASONICA_CMD_TIMEOUT, POS, 600),
+  POLL:           num(cfg.SASONICA_POLL, POS, 5),
+  PROGRESS_EVERY: num(cfg.SASONICA_PROGRESS_EVERY, NAT, 10),
+  KEEP_DAYS:      num(cfg.SASONICA_KEEP_DAYS, POS, 30),
+  LOAD_MAX:       num(cfg.SASONICA_LOAD_MAX, DEC, 0),
 };
 const RELOADABLE = [
-  ['PARALLEL', 'RUNLET_PARALLEL', POS, 1, ''],
-  ['BACKGROUND_MAX', 'RUNLET_BACKGROUND_MAX', POS, 4, ''],
-  ['CMD_TIMEOUT', 'RUNLET_CMD_TIMEOUT', POS, 600, 's'],
-  ['POLL', 'RUNLET_POLL', POS, 5, 's'],
-  ['PROGRESS_EVERY', 'RUNLET_PROGRESS_EVERY', NAT, 10, 's'],
-  ['KEEP_DAYS', 'RUNLET_KEEP_DAYS', POS, 30, ''],
-  ['LOAD_MAX', 'RUNLET_LOAD_MAX', DEC, 0, ''],
+  ['PARALLEL', 'SASONICA_PARALLEL', POS, 1, ''],
+  ['BACKGROUND_MAX', 'SASONICA_BACKGROUND_MAX', POS, 4, ''],
+  ['CMD_TIMEOUT', 'SASONICA_CMD_TIMEOUT', POS, 600, 's'],
+  ['POLL', 'SASONICA_POLL', POS, 5, 's'],
+  ['PROGRESS_EVERY', 'SASONICA_PROGRESS_EVERY', NAT, 10, 's'],
+  ['KEEP_DAYS', 'SASONICA_KEEP_DAYS', POS, 30, ''],
+  ['LOAD_MAX', 'SASONICA_LOAD_MAX', DEC, 0, ''],
 ];
 function reloadTunables() {
   if (!existsSync(ENV_FILE)) return;
   const env = loadEnv();
   for (const [field, key, re, dflt, unit] of RELOADABLE) {
-    // An absent line means the default, so deleting RUNLET_LOAD_MAX releases
+    // An absent line means the default, so deleting SASONICA_LOAD_MAX releases
     // a hold rather than leaving the last value latched.
     const want = key in env ? num(env[key], re, T[field]) : dflt;
     if (want !== T[field]) {
@@ -115,8 +121,8 @@ function reloadTunables() {
 // token for its own Worker and no Cloudflare credential at all: a D1 API
 // token is account-wide, so one on every machine would reach every other
 // machine's queue.
-const WORKER_URL = (cfg.RUNLET_WORKER_URL || '').replace(/\/+$/, '');
-const RUNNER_TOKEN = cfg.RUNLET_RUNNER_TOKEN || '';
+const WORKER_URL = (cfg.SASONICA_WORKER_URL || '').replace(/\/+$/, '');
+const RUNNER_TOKEN = cfg.SASONICA_RUNNER_TOKEN || '';
 
 // --- signing: identical to relay_hmac / relay_ct_equal ----------------------
 // Note the newline between nonce and command — it is part of the signed text.
@@ -132,29 +138,29 @@ function ctEqual(a, b) {
 const [sub, ...rest] = process.argv.slice(2);
 
 if (sub === '--help' || sub === '-h' || sub === 'help') {
-  console.log(`runlet: run signed shell commands queued by an assistant, on this machine.
+  console.log(`sasonica: Sasonica Shell runs signed shell commands queued by an assistant, on this machine.
 
-  runlet skills        the tools the owner has set up here, and where to read about each
-  runlet status [n]    the last n rows (default 10), newest first
-  runlet --once        one poll, then exit
-  runlet               poll forever (what the service runs)
-  runlet sign <nonce> <command>   the signature this runner expects
+  sasonica skills        the tools the owner has set up here, and where to read about each
+  sasonica status [n]    the last n rows (default 10), newest first
+  sasonica --once        one poll, then exit
+  sasonica               poll forever (what the service runs)
+  sasonica sign <nonce> <command>   the signature this runner expects
 
 Config: ${ENV_FILE}
-  RUNLET_WORKER_URL     this machine's Worker
-  RUNLET_RUNNER_TOKEN   its bearer token (no Cloudflare credential lives here)
-  RUNLET_KEY_FILE       hex key shared with the Worker (default relay.key beside env)
-  RUNLET_POLL           seconds between polls (default 5)
-  RUNLET_CMD_TIMEOUT    seconds a command may run (default 600)
-  RUNLET_MAX_OUTPUT     bytes of output kept (default 60000)
-  RUNLET_PARALLEL       commands run at once (default 1: strictly in order)
-  RUNLET_BACKGROUND_MAX rows sent with background=true running at once (default 4)
-  RUNLET_DETACH_CHECK   seconds between looks for a detach or cancel (default 3)
-  RUNLET_KEEP_DAYS      finished rows older than this are deleted daily (default 30)
-  RUNLET_PROGRESS_EVERY seconds between progress copies (default 10; 0 = off)
-  RUNLET_LOAD_MAX       hold new commands above this 1-minute load average (0 = off)
-  RUNLET_RUNNER_ID      this runner's name on the rows it claims (default: hostname)
-  RUNLET_SKILLS_DIR     SKILL.md files that \`skills\` lists (default skills/ beside env)
+  SASONICA_WORKER_URL     this machine's Worker
+  SASONICA_RUNNER_TOKEN   its bearer token (no Cloudflare credential lives here)
+  SASONICA_KEY_FILE       hex key shared with the Worker (default relay.key beside env)
+  SASONICA_POLL           seconds between polls (default 5)
+  SASONICA_CMD_TIMEOUT    seconds a command may run (default 600)
+  SASONICA_MAX_OUTPUT     bytes of output kept (default 60000)
+  SASONICA_PARALLEL       commands run at once (default 1: strictly in order)
+  SASONICA_BACKGROUND_MAX rows sent with background=true running at once (default 4)
+  SASONICA_DETACH_CHECK   seconds between looks for a detach or cancel (default 3)
+  SASONICA_KEEP_DAYS      finished rows older than this are deleted daily (default 30)
+  SASONICA_PROGRESS_EVERY seconds between progress copies (default 10; 0 = off)
+  SASONICA_LOAD_MAX       hold new commands above this 1-minute load average (0 = off)
+  SASONICA_RUNNER_ID      this runner's name on the rows it claims (default: hostname)
+  SASONICA_SKILLS_DIR     SKILL.md files that \`skills\` lists (default skills/ beside env)
 
 Every tunable above is re-read each poll: edit the file and it is live within
 one interval.`);
@@ -170,9 +176,9 @@ if (sub === 'sign') {
 
 if (sub === 'skills') {
   // What this machine offers beyond a bare shell, one entry per file in
-  // RUNLET_SKILLS_DIR. The owner curates the directory; nothing is found by
+  // SASONICA_SKILLS_DIR. The owner curates the directory; nothing is found by
   // scanning the disk. The assistant reads a file in full only when it needs it.
-  const dir = cfg.RUNLET_SKILLS_DIR || path.join(CONF, 'skills');
+  const dir = cfg.SASONICA_SKILLS_DIR || path.join(CONF, 'skills');
   let entries = [];
   try { entries = readdirSync(dir).sort(); } catch { /* missing = none */ }
   if (!entries.length) {
@@ -222,8 +228,8 @@ function checkWorkerUrl(raw) {
 }
 const urlProblem = WORKER_URL ? checkWorkerUrl(WORKER_URL) : 'is not set';
 if (urlProblem || !RUNNER_TOKEN) {
-  throw new Error(`runlet: RUNLET_WORKER_URL ${urlProblem ?? 'is set'}`
-    + `${RUNNER_TOKEN ? '' : ' and RUNLET_RUNNER_TOKEN is not set'} in ${ENV_FILE}`
+  throw new Error(`sasonica: SASONICA_WORKER_URL ${urlProblem ?? 'is set'}`
+    + `${RUNNER_TOKEN ? '' : ' and SASONICA_RUNNER_TOKEN is not set'} in ${ENV_FILE}`
     + ' — re-run the installer if this machine predates them');
 }
 
@@ -252,7 +258,7 @@ async function api(op, body = {}) {
   // A 404 is what a wrong or missing token looks like, deliberately: the
   // Worker will not confirm that the runner API is there.
   if (r.status === 404) {
-    throw new Error('the Worker refused this runner (check RUNLET_RUNNER_TOKEN)');
+    throw new Error('the Worker refused this runner (check SASONICA_RUNNER_TOKEN)');
   }
   const out = await r.json().catch(() => null);
   if (!r.ok || out?.error) throw new Error(`worker: ${out?.error ?? r.status}`);
@@ -269,12 +275,12 @@ const writeResult = (id, status, code, output) =>
 // Detached is for POSIX, where it is setsid() and gives the process group
 // that killTree's process.kill(-pid) needs. On Windows nothing is needed:
 // taskkill /T walks the parent-child tree by pid, which a bare kill misses.
-const SHELL = WIN ? (cfg.RUNLET_SHELL || 'powershell.exe') : '/bin/bash';
+const SHELL = WIN ? (cfg.SASONICA_SHELL || 'powershell.exe') : '/bin/bash';
 const shellArgs = (command) => WIN
   ? ['-NoLogo', '-NonInteractive', '-NoProfile', '-Command', command]
   : ['-lc', command];
 
-// The FIRST MAX_OUTPUT bytes, as runlet.sh's `head -c` keeps: the start of a
+// The FIRST MAX_OUTPUT bytes, as the bash runner's `head -c` kept: the start of a
 // failing command's output is the part that says why. Read without pulling a
 // multi-gigabyte log into memory.
 const head = (file) => {
@@ -305,7 +311,7 @@ function killTree(pid, force) {
 // alive": a shell that does not trap TERM dies at once while a descendant
 // that does traps it survives, and waiting on the child alone would skip the
 // forced kill and leave that descendant running. This is the group probe
-// runlet.sh made with `kill -0 -- -$pgid`.
+// the bash runner made with `kill -0 -- -$pgid`.
 function groupAlive(pid) {
   if (WIN) return false;           // taskkill /T walks the tree in one go
   try { process.kill(-pid, 0); return true; } catch { return false; }
@@ -407,13 +413,13 @@ function executeAndWatch(id, command) {
     const out = head(outFile);
     try { unlinkSync(outFile); } catch {}
     if (cancelled) {
-      await writeResult(id, 'cancelled', -1, `${out}\nrunlet: cancelled after it had `
+      await writeResult(id, 'cancelled', -1, `${out}\nsasonica: cancelled after it had `
         + 'started; whatever it did before that is done');
       log(`#${id}: cancelled, ${out.length} bytes of output kept`);
     } else if (timedOut) {
-      // 124, the code `timeout` gives runlet.sh, so both runners report a
-      // timeout the same way to anything reading exit_code.
-      await writeResult(id, 'timeout', 124, `${out}\nrunlet: killed after `
+      // 124, the code `timeout` gave the bash runner, so a timeout reads the
+      // same to anything written against exit_code before the port.
+      await writeResult(id, 'timeout', 124, `${out}\nsasonica: killed after `
         + `${T.CMD_TIMEOUT}s`);
       log(`#${id}: timed out`);
     } else {
@@ -441,12 +447,12 @@ async function runOne({ id, command, sig, nonce }) {
   const settled = { lane: Promise.resolve(), done: Promise.resolve() };
   if (seen(nonce)) {
     log(`#${id}: nonce already used — rejecting as a replay`);
-    await writeResult(id, 'rejected', -1, 'runlet: replayed nonce');
+    await writeResult(id, 'rejected', -1, 'sasonica: replayed nonce');
     return settled;
   }
   if (!ctEqual(hmac(nonce, command), sig)) {
     log(`#${id}: BAD SIGNATURE — not executing`);
-    await writeResult(id, 'rejected', -1, 'runlet: signature did not verify');
+    await writeResult(id, 'rejected', -1, 'sasonica: signature did not verify');
     return settled;
   }
   appendFileSync(SEEN, `${nonce}\n`);     // append-only: safe under parallelism
@@ -458,7 +464,7 @@ async function runOne({ id, command, sig, nonce }) {
     return executeAndWatch(id, command);
   } catch (e) {
     log(`#${id}: failed to start: ${e.message}`);
-    await writeResult(id, 'error', -1, `runlet: ${e.message}`);
+    await writeResult(id, 'error', -1, `sasonica: ${e.message}`);
     return settled;
   }
 }
@@ -494,12 +500,12 @@ function overLoadCeiling() {
     return false;
   }
   if (WIN) {
-    if (!loadWarned) { log('RUNLET_LOAD_MAX is set but Windows has no load average — ignoring it'); loadWarned = true; }
+    if (!loadWarned) { log('SASONICA_LOAD_MAX is set but Windows has no load average — ignoring it'); loadWarned = true; }
     return false;
   }
   const load = loadavg()[0];
   if (load > T.LOAD_MAX) {
-    if (!loadHeld) log(`load average ${load.toFixed(2)} is over RUNLET_LOAD_MAX=${T.LOAD_MAX} — not starting new commands until it drops`);
+    if (!loadHeld) log(`load average ${load.toFixed(2)} is over SASONICA_LOAD_MAX=${T.LOAD_MAX} — not starting new commands until it drops`);
     loadHeld = true;
     return true;
   }
@@ -537,7 +543,7 @@ async function poll() {
 }
 
 // --- maintenance -------------------------------------------------------------
-// Finished rows older than RUNLET_KEEP_DAYS go. The table is the only thing
+// Finished rows older than SASONICA_KEEP_DAYS go. The table is the only thing
 // here that grows without bound, and nothing reads an old result.
 async function pruneOld() {
   const { changed } = await api('prune', { keepDays: T.KEEP_DAYS });
@@ -562,10 +568,10 @@ async function sweepStale() {
 
 if (sub === '--once') {
   const n = await poll();
-  await Promise.all([...inFlight]);      // `runlet.sh --once` ends with `wait`
+  await Promise.all([...inFlight]);      // the bash runner's --once ended with `wait`
   log(`polled, ${n} row(s)`);
 } else {
-  log(`runlet runner starting as ${RUNNER_ID}, polling every ${T.POLL}s`
+  log(`Sasonica Shell runner starting as ${RUNNER_ID}, polling every ${T.POLL}s`
     + ` with a ${T.CMD_TIMEOUT}s limit per command`
     + (T.PARALLEL > 1 ? `, up to ${T.PARALLEL} at once` : ''));
   await sweepOrphans();

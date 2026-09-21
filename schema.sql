@@ -1,4 +1,4 @@
--- runlet schema. One table. Applied by install.sh; safe to re-run.
+-- Sasonica Shell schema. One table. Applied by install.mjs; safe to re-run.
 CREATE TABLE IF NOT EXISTS commands (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   command    TEXT    NOT NULL,

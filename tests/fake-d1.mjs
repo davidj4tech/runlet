@@ -14,7 +14,7 @@ export const sign = (key, nonce, command) =>
   createHmac('sha256', key).update(`${nonce}\n${command}`).digest('hex');
 
 // Rows default to "just created". A fixed past date would put every row
-// beyond RUNLET_KEEP_DAYS, and the runner prunes on its first loop, so a
+// beyond SASONICA_KEEP_DAYS, and the runner prunes on its first loop, so a
 // test's rows would quietly vanish under it. A test that wants an old row
 // passes created_at itself.
 const NOW = new Date().toISOString().replace('T', ' ').slice(0, 19);

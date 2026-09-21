@@ -1,5 +1,5 @@
 {
-  "name": "runlet-worker",
+  "name": "sasonica-shell-worker",
   "private": true,
   "version": "0.1.0",
   "scripts": {

@@ -1,7 +1,7 @@
-# runlet.service — systemd *user* unit. install.sh writes the real paths
-# and installs it to ~/.config/systemd/user/, then enables it.
+# sasonica-shell.service — systemd *user* unit. install.mjs writes the real
+# paths and installs it to ~/.config/systemd/user/, then enables it.
 [Unit]
-Description=runlet runner (executes signed commands from the queue)
+Description=Sasonica Shell runner (executes signed commands from the queue)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,8 +9,8 @@ Wants=network-online.target
 Type=simple
 # KillMode=control-group (the default) takes the jobs with it, and the runner
 # also kills them itself on SIGTERM, which is what launchd needs.
-ExecStart=__NODE_BIN__/node __LITE_DIR__/runlet.mjs
-EnvironmentFile=-%h/.config/runlet/env
+ExecStart=__NODE_BIN__/node __LITE_DIR__/sasonica.mjs
+EnvironmentFile=-%h/.config/sasonica/env
 Environment=PATH=__LITE_DIR__/worker/node_modules/.bin:__NODE_BIN__:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=10

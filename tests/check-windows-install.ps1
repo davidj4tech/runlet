@@ -38,7 +38,7 @@ Test-Case 'a usable Node is found and returned' {
 Test-Case 'the bootstrap hands over and decides nothing itself' {
   $src = [IO.File]::ReadAllText((Join-Path $Root 'install.ps1'))
   Assert-True ($src -match 'install\.mjs') 'it never calls install.mjs'
-  foreach ($gone in @('d1/database', 'wrangler', 'RUNLET_URL_SECRET', 'Register-ScheduledTask')) {
+  foreach ($gone in @('d1/database', 'wrangler', 'SASONICA_URL_SECRET', 'Register-ScheduledTask')) {
     Assert-True ($src -notmatch [regex]::Escape($gone)) "provisioning is back in install.ps1: $gone"
   }
 }

@@ -22,7 +22,7 @@ class BootstrapTests(unittest.TestCase):
     """install.sh now only finds Node and hands over to install.mjs."""
 
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="runlet-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="sasonica-test-")
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.home = self.base / "home with spaces & chars"
@@ -35,24 +35,24 @@ class BootstrapTests(unittest.TestCase):
         self.log = self.base / "calls"
         self.env = dict(os.environ, HOME=str(self.home),
                         PATH=str(self.bin) + ":/usr/bin:/bin",
-                        RUNLET_TEST_LOG=str(self.log), RUNLET_TEST_OS="Linux")
-        for key in ("RUNLET", "RUNLET_CONF"):
+                        SASONICA_TEST_LOG=str(self.log), SASONICA_TEST_OS="Linux")
+        for key in ("SASONICA", "SASONICA_CONF"):
             self.env.pop(key, None)
-        self.stub("uname", 'echo "${RUNLET_TEST_OS}"')
+        self.stub("uname", 'echo "${SASONICA_TEST_OS}"')
         # Drop sudo's own options only; shifting unconditionally turned
         # `sudo apt-get install ...` into /usr/bin/install.
-        self.stub("sudo", 'echo "sudo $*" >> "$RUNLET_TEST_LOG"; '
+        self.stub("sudo", 'echo "sudo $*" >> "$SASONICA_TEST_LOG"; '
                           'while [[ "$1" == -* ]]; do shift; done; "$@"')
-        self.stub("apt-get", 'echo "apt-get $*" >> "$RUNLET_TEST_LOG"')
-        self.stub("curl", 'echo "curl $*" >> "$RUNLET_TEST_LOG"')
-        self.stub("brew", 'echo "brew $*" >> "$RUNLET_TEST_LOG"; if [[ "$1" == --prefix ]]; then echo /brew; fi')
+        self.stub("apt-get", 'echo "apt-get $*" >> "$SASONICA_TEST_LOG"')
+        self.stub("curl", 'echo "curl $*" >> "$SASONICA_TEST_LOG"')
+        self.stub("brew", 'echo "brew $*" >> "$SASONICA_TEST_LOG"; if [[ "$1" == --prefix ]]; then echo /brew; fi')
 
     def stub(self, name, body):
         write_executable(self.bin / name, "#!/bin/bash\n" + body + "\n")
 
     def with_node(self, version="v22.16.0"):
         self.stub("node", 'if [[ "$1" == -v ]]; then echo "' + version + '"; '
-                          'else echo "node $*" >> "$RUNLET_TEST_LOG"; fi')
+                          'else echo "node $*" >> "$SASONICA_TEST_LOG"; fi')
 
     def run_install(self, *args):
         return subprocess.run(["/bin/bash", str(self.repo / "install.sh"), *args],
@@ -89,14 +89,14 @@ class BootstrapTests(unittest.TestCase):
         # cannot be simulated by emptying PATH.
         if any(Path(p).exists() for p in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")):
             self.skipTest("this machine has Homebrew; its absence cannot be faked")
-        self.env["RUNLET_TEST_OS"] = "Darwin"
+        self.env["SASONICA_TEST_OS"] = "Darwin"
         (self.bin / "brew").unlink()
         result = self.run_install()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Homebrew", result.stderr)
 
     def test_unsupported_os_is_refused(self):
-        self.env["RUNLET_TEST_OS"] = "SunOS"
+        self.env["SASONICA_TEST_OS"] = "SunOS"
         result = self.run_install()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unsupported operating system", result.stderr)
@@ -137,7 +137,7 @@ class WorkerTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
-    """runlet.mjs against the real Worker -- see tests/check-runner.mjs."""
+    """sasonica.mjs against the real Worker -- see tests/check-runner.mjs."""
 
     def test_runner(self):
         node = shutil.which("node")
