@@ -240,6 +240,24 @@ If the URL is exposed:
 
 The old path stops being valid after the Worker is redeployed with the new secret.
 
+If only one assistant's URL leaked and it has its own (`sasonica client add`), revoke that one instead; nothing else changes:
+
+```sh
+sasonica client revoke chatgpt
+```
+
+It stops working within 30 seconds. See [Several assistants](README.md#several-assistants).
+
+## Give an assistant its own URL
+
+```sh
+sasonica client add chatgpt
+```
+
+prints a new connector URL, once; paste it into that assistant. `sasonica client list` shows every client and when each last queued a command; `sasonica client revoke <label>` turns one off. `revoke default` turns off the shared URL above, until it is rotated.
+
+These commands need the Cloudflare token you gave the installer (D1: Edit), since they write the database directly: set `CLOUDFLARE_API_TOKEN`, or keep it in `~/.config/sasonica/install-token` (mode 600). The runner's token is not enough, on purpose.
+
 ## Rotate a machine's runner token
 
 `SASONICA_RUNNER_TOKEN` is what a machine presents to its own Worker. Replacing it touches neither the database nor the connector URL:

@@ -109,11 +109,34 @@ Sasonica Shell is intentionally capability-based and minimal. It does not try to
 
 ### Secret connector URL
 
-The endpoint is `/<secret>/mcp`; other paths return 404. The secret is five random words from the bundled EFF short wordlist by default, roughly 52 bits of entropy. The comparison is constant-time.
+The endpoint is `/<secret>/mcp`; other paths, and revoked secrets, return 404. The secret is five random words from the bundled EFF short wordlist by default, roughly 52 bits of entropy. The comparison is constant-time.
 
 Use `SASONICA_SECRET_WORDS=6` during installation if you want a longer secret. Fewer than four words are refused.
 
-To rotate a leaked connector URL, remove `SASONICA_URL_SECRET` from `~/.config/sasonica/env` and run the installer again.
+To rotate a leaked connector URL, remove `SASONICA_URL_SECRET` from `~/.config/sasonica/env` and run the installer again. If each assistant has its own URL (below), revoke just the one that leaked instead.
+
+### Several assistants
+
+One shared URL is fine for several assistants: Claude.ai, ChatGPT and a phone app can all use it, and every row still says who asked (see *Who asked*, below).
+
+Give an assistant a URL of its own when you want to be able to cut it off without re-pasting a new URL into all the others:
+
+```bash
+sasonica client add chatgpt      # prints https://.../<secret>/mcp once
+sasonica client list             # label, created, revoked, last used
+sasonica client revoke chatgpt   # that URL is a 404 within 30 seconds
+```
+
+Only the sha256 of each secret is stored, so the URL cannot be printed again; `add` a new label, or revoke and re-`add` the same one, if it is lost. A revocation takes effect within **30 seconds**: each Worker isolate remembers a lookup for that long so that a burst of calls costs one D1 read. The shared URL is the client `default`; `sasonica client revoke default` turns it off (per-client URLs keep working) until you rotate `SASONICA_URL_SECRET`.
+
+These commands write the `clients` table with the Cloudflare token the installer used, from `CLOUDFLARE_API_TOKEN` or `~/.config/sasonica/install-token`. The runner's own token cannot mint URLs, by design: it is the credential that sits on the machine all day.
+
+### Who asked
+
+Every row records two things, and `sasonica status` shows them as `client/agent`, e.g. `default/claude-ai@1.0`:
+
+- **client**: which URL queued it (`default` or a label from `sasonica client`). This is the one that means something, because the URL is the credential.
+- **agent**: what the assistant says it is. The Worker reads `clientInfo.name` from MCP `initialize` (falling back to the first token of the `User-Agent`, written `ua:...`) and hands it back inside a signed `Mcp-Session-Id`, which clients send on later requests. Any client can claim any name, so this is attribution, not security; a client that does not echo the session id is still served, and its rows fall back to `ua:...` or `unknown`.
 
 ### Signed rows
 
@@ -246,7 +269,7 @@ The CI matrix runs these checks on Linux and macOS, including the Mac's system B
 
 ## Deliberate non-features
 
-Sasonica Shell does **not** provide OAuth, per-client permissions, command allowlists, audit identity for which assistant queued a row, persistent shell sessions, or an agent runtime on the target machine.
+Sasonica Shell does **not** provide OAuth, per-client permissions, command allowlists, verified identity for which assistant queued a row (the client label says which URL; the agent name is only what the assistant claims), persistent shell sessions, or an agent runtime on the target machine.
 
 Those omissions are part of the design. If you need richer client identity, session routing, or multi-user policy, see [tmux-relay](https://github.com/davidj4tech/tmux-relay), the larger system from which Sasonica Shell was distilled. The two projects use the same command-signing scheme.
 
@@ -255,12 +278,14 @@ Those omissions are part of the design. If you need richer client identity, sess
 | File | Purpose |
 |---|---|
 | `worker/src/index.ts` | Remote MCP Worker: four tools, signing, queueing, and result retrieval. |
-| `schema.sql` | D1 schema: one command table and its pending-row index. |
+| `schema.sql` | D1 schema: the command table and its pending-row index, and the per-client URL table. |
 | `sasonica.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
 | `install.mjs` | The installer on every platform: provisioning, config, and the service. |
 | `install.sh` | Linux/macOS bootstrap: finds Node, hands over to `install.mjs`. |
 | `sasonica-shell.service` | systemd user-service template. |
 | `install.ps1` | Windows bootstrap: finds Node, hands over to `install.mjs`. |
+| `lib/clients.mjs` | `sasonica client` add, list and revoke: per-assistant connector URLs. |
+| `lib/cloudflare.mjs` | The Cloudflare API and D1 queries, shared by the installer and `sasonica client`. |
 | `lib/service-systemd.mjs` | The systemd user service. |
 | `lib/service-macos.mjs` | The macOS LaunchAgent. |
 | `lib/service-windows.mjs` | The Windows Scheduled Task. |
@@ -272,7 +297,7 @@ Those omissions are part of the design. If you need richer client identity, sess
 | `tests/check-runner.mjs` | The runner driven against the real Worker over real SQLite. |
 | `tests/check-install.mjs` | What the installer decides: names, secrets, the env file, each service definition. |
 | `tests/check-windows-install.ps1` | The Windows bootstrap: that it finds Node and hands over. |
-| `tests/check-worker.mjs` | The Worker's runner API, executed against real SQLite via `tests/fake-d1.mjs`. |
+| `tests/check-worker.mjs` | The Worker's runner API, client URLs and attribution, executed against real SQLite via `tests/fake-d1.mjs`. |
 
 ## License
 

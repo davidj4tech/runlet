@@ -1,6 +1,6 @@
 # Typed tools, phone approvals, and assistants as threads (proposal, 21 Sep 2026)
 
-Status: **proposal, nothing built.** How Sasonica Shell and the assistants that use it
+Status: **proposal; §3's client labels are built** (21 Sep 2026), the rest is not. How Sasonica Shell and the assistants that use it
 (Claude.ai, ChatGPT custom connectors, any remote MCP host) fit into the
 Sasonica umbrella (`umbrella.md`) beyond "a shell with a skills list".
 
@@ -163,12 +163,22 @@ Sasonica Shell stays usable on its own, as its README promises.
 Sasonica app as a thread, next to the desk's Claude Code sessions. The phone
 becomes the one place to see what every agent is doing.
 
-- **Who asked.** Sasonica Shell cannot say today (the README lists "no audit
-  identity" as a non-goal). The cheap fix: **one connector URL per
-  client**. `SASONICA_URL_SECRET` becomes a small table of `(secret,
-  client_label)` — `claude.ai`, `chatgpt`, `phone-claude`. Each row records
-  its client. It also gives per-client revocation, which today means
-  rotating the one secret everyone shares.
+- **Who asked. Done.** Two answers, side by side on every row:
+  - `client`: **one connector URL per client**. A `clients(label,
+    secret_sha256, created_at, revoked_at)` table beside the shared
+    `SASONICA_URL_SECRET` (label `default`), managed with `sasonica client
+    add|list|revoke` using the installer's Cloudflare token, never the
+    runner's. It gives per-client revocation (within the Worker's 30 s
+    cache) instead of rotating the one secret everyone shares.
+  - `agent`: what the assistant calls itself — `clientInfo.name@version`
+    from `initialize`, else `ua:<User-Agent>`. The Worker hands it back in
+    a signed, stateless `Mcp-Session-Id` (key derived from
+    `SASONICA_HMAC_KEY`, bound to the URL's label) and reads it on later
+    requests; a client that does not echo it still works. Attribution on a
+    shared URL, not security.
+
+  `sasonica status` shows both as `client/agent`; the thread below can name
+  itself from them.
 - **The thread.** The runner already sees every row. It appends each row
   (client, command or tool call, status, trimmed output) to a local
   journal, and agent-media reads that journal as a thread source. In
@@ -220,6 +230,7 @@ but it is the one that makes interactive use (§4) feel immediate.
 ## Order
 
 1. §3's client labels — tiny, and every later step wants to know who asked.
+   **Done**, with the self-reported agent name alongside.
 2. §1 typed tools, with the agent-media manifests.
 3. §2 policy and approvals — needs the app's approval UI (the rebuild, in
    progress) and a local approval endpoint in agent-media.
