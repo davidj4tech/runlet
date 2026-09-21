@@ -1,23 +1,25 @@
-# runlet
+# Sasonica Shell
 
 Run shell commands on your own computer from an AI assistant, without opening an inbound port, exposing SSH, or keeping an agent runtime on the machine.
 
-Runlet is deliberately small. A remote MCP client queues a signed command through a Cloudflare Worker; a local runner polls for it, verifies it, runs it, and writes the result back.
+Sasonica Shell is the shell piece of [Sasonica](docs/umbrella.md). It was called Runlet until 21 September 2026; an install made under that name moves across with [MIGRATING.md](MIGRATING.md).
+
+Sasonica Shell is deliberately small. A remote MCP client queues a signed command through a Cloudflare Worker; a local runner polls for it, verifies it, runs it, and writes the result back.
 
 ```text
 assistant  ──MCP──▶  Cloudflare Worker  ──▶  signed row in D1
                                                    ▲
-your machine ◀──────── runlet.mjs polls, verifies, runs, returns output
+your machine ◀──────── sasonica.mjs polls, verifies, runs, returns output
 ```
 
 The local machine only makes outbound HTTPS requests. It needs no public IP, open port, VPN, or inbound firewall rule.
 
 > [!WARNING]
-> Runlet executes shell commands **as your user**. Anyone who has the secret connector URL can ask the Worker to queue commands for that machine. Treat the URL like a password, and only give it to assistants or clients you trust.
+> Sasonica Shell executes shell commands **as your user**. Anyone who has the secret connector URL can ask the Worker to queue commands for that machine. Treat the URL like a password, and only give it to assistants or clients you trust.
 
-## What Runlet is
+## What Sasonica Shell is
 
-Runlet is a small remote-execution primitive, not an agent framework. It does one job: give an MCP-capable assistant a shell on a machine you control.
+Sasonica Shell is a small remote-execution primitive, not an agent framework. It does one job: give an MCP-capable assistant a shell on a machine you control.
 
 That makes it useful on its own, or as a low-level building block underneath larger agent, automation, CI, homelab, and administration workflows.
 
@@ -25,7 +27,7 @@ It works with MCP clients that can connect to a remote server by URL, including 
 
 ## Tools
 
-Runlet exposes four MCP tools:
+Sasonica Shell exposes four MCP tools:
 
 | Tool | Purpose |
 |---|---|
@@ -53,19 +55,19 @@ Each command starts in a fresh `bash -lc` shell. Shell state, including the work
 
 ## Skills
 
-A shell alone does not tell an assistant what is worth running. List the tools you have set up on the machine, one file per tool, in `~/.config/runlet/skills/`:
+A shell alone does not tell an assistant what is worth running. List the tools you have set up on the machine, one file per tool, in `~/.config/sasonica/skills/`:
 
 ```bash
-ln -s ~/projects/agent-mail/skills/agent-mail/SKILL.md ~/.config/runlet/skills/agent-mail.md
+ln -s ~/projects/agent-mail/skills/agent-mail/SKILL.md ~/.config/sasonica/skills/agent-mail.md
 ```
 
-Each entry is a Markdown file, a symlink to one, or a directory containing a `SKILL.md`. Its frontmatter should give a `name:` and a `description:`. The `run_command` description tells the assistant to start with `runlet skills`. `install.sh` links `runlet` into `~/.local/bin`, and `runlet --help` points there too. That command prints each skill's name, its description and the path to read before using it. Where `~/.local/bin` is not on the login-shell `PATH`, `"$RUNLET" skills` works instead: the runner sets `$RUNLET` for every command it runs. Nothing is found by scanning the disk: a tool is listed only when you put it in this directory.
+Each entry is a Markdown file, a symlink to one, or a directory containing a `SKILL.md`. Its frontmatter should give a `name:` and a `description:`. The `run_command` description tells the assistant to start with `sasonica skills`. The installer puts a `sasonica` command in `~/.local/bin`, and `sasonica --help` points there too. That command prints each skill's name, its description and the path to read before using it. Where `~/.local/bin` is not on the login-shell `PATH`, `"$SASONICA" skills` works instead: the runner sets `$SASONICA` for every command it runs. Nothing is found by scanning the disk: a tool is listed only when you put it in this directory.
 
 ## How it works
 
 1. The MCP client calls the Worker through a secret URL.
 2. The Worker creates a nonce, signs `nonce + "\n" + command` with HMAC-SHA256, and writes the command to D1.
-3. `runlet.mjs` polls its Worker over HTTPS, with a per-machine bearer token; the Worker is the only thing that touches D1.
+3. `sasonica.mjs` polls its Worker over HTTPS, with a per-machine bearer token; the Worker is the only thing that touches D1.
 4. The runner verifies the signature and rejects reused nonces.
 5. The runner atomically claims the row, then executes the command locally.
 6. Output, exit status, runner identity, and final state are written back to D1.
@@ -92,26 +94,26 @@ The short version for an existing Cloudflare user:
 
    On macOS, install [Homebrew](https://brew.sh) first; the same `./install.sh` sets up dependencies and a login LaunchAgent.
 
-   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is `win\runlet.mjs` (Node), started by a Scheduled Task at logon.
+   On Windows, run `.\install.ps1` from PowerShell. It is a native installer: no WSL2, no Ubuntu. The runner there is the same `sasonica.mjs` under Node, started by a Scheduled Task at logon.
 3. Add the printed `https://.../<secret>/mcp` URL to your MCP client as a remote/custom connector with no additional authentication.
 
-The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows). The runner is the same `runlet.mjs` on all three.
+The installer creates the D1 database, applies the schema, creates the Worker, generates the signing key and URL secret, stores the required Worker secrets, deploys the Worker, runs an end-to-end smoke test, writes the local config, and starts the runner as a systemd user service (Linux), a LaunchAgent (macOS), or a Scheduled Task (Windows). The runner is the same `sasonica.mjs` on all three.
 
-Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them.
+Re-running the installer is safe. Existing IDs and secrets are reused unless you deliberately rotate them. Once a machine has the `sasonica` command, `sasonica install` re-runs it from anywhere, with the same flags (`--no-service`, `--print-url`); `sasonica install shell` is the same thing, named the way the [umbrella](docs/umbrella.md#installer-shape) names its pieces.
 
-Several machines can share one Cloudflare account. Each gets its own Worker and D1 database named `runlet-<site>`; the site name defaults to the hostname. Copy `install.conf.example` to `install.conf` if you want to pre-answer the installer prompts.
+Several machines can share one Cloudflare account. Each gets its own Worker and D1 database named `sasonica-shell-<site>`; the site name defaults to the hostname. Copy `install.conf.example` to `install.conf` if you want to pre-answer the installer prompts.
 
 ## Security model
 
-Runlet is intentionally capability-based and minimal. It does not try to be a multi-user authorization system.
+Sasonica Shell is intentionally capability-based and minimal. It does not try to be a multi-user authorization system.
 
 ### Secret connector URL
 
 The endpoint is `/<secret>/mcp`; other paths return 404. The secret is five random words from the bundled EFF short wordlist by default, roughly 52 bits of entropy. The comparison is constant-time.
 
-Use `RUNLET_SECRET_WORDS=6` during installation if you want a longer secret. Fewer than four words are refused.
+Use `SASONICA_SECRET_WORDS=6` during installation if you want a longer secret. Fewer than four words are refused.
 
-To rotate a leaked connector URL, remove `RUNLET_URL_SECRET` from `~/.config/runlet/env` and run the installer again.
+To rotate a leaked connector URL, remove `SASONICA_URL_SECRET` from `~/.config/sasonica/env` and run the installer again.
 
 ### Signed rows
 
@@ -121,7 +123,7 @@ The runner also records seen nonces and refuses replays.
 
 ### Local execution boundary
 
-Commands run as the account that owns the runner service. Runlet has no command allowlist or sandbox of its own. Normal operating-system permissions remain the boundary.
+Commands run as the account that owns the runner service. Sasonica Shell has no command allowlist or sandbox of its own. Normal operating-system permissions remain the boundary.
 
 The defaults are:
 
@@ -136,25 +138,25 @@ A cancellation stops future execution, but it cannot undo side effects a command
 
 ## Queueing and concurrency
 
-By default Runlet is serial: one foreground command finishes before the next begins. This keeps command order predictable.
+By default Sasonica Shell is serial: one foreground command finishes before the next begins. This keeps command order predictable.
 
-Set `RUNLET_PARALLEL=4` in `~/.config/runlet/env` to allow up to four foreground commands at once. The runner reloads several operational settings while it is running, so many tuning changes do not need a service restart.
+Set `SASONICA_PARALLEL=4` in `~/.config/sasonica/env` to allow up to four foreground commands at once. The runner reloads several operational settings while it is running, so many tuning changes do not need a service restart.
 
-A single command can bypass the foreground lane with `run_command(..., background=true)`. Background jobs have their own cap, `RUNLET_BACKGROUND_MAX`, which defaults to 4.
+A single command can bypass the foreground lane with `run_command(..., background=true)`. Background jobs have their own cap, `SASONICA_BACKGROUND_MAX`, which defaults to 4.
 
-`detach` promotes an already-running foreground command out of the lane without killing it. The runner checks for detach and cancel requests every `RUNLET_DETACH_CHECK` seconds, default 3.
+`detach` promotes an already-running foreground command out of the lane without killing it. The runner checks for detach and cancel requests every `SASONICA_DETACH_CHECK` seconds, default 3.
 
 ## Failure handling
 
-Runlet tries to make ambiguous states visible rather than pretending they did not happen.
+Sasonica Shell tries to make ambiguous states visible rather than pretending they did not happen.
 
 - A runner restart marks that runner's in-flight rows as `error`, with a note that the command may or may not have completed.
 - A row that remains `running` well beyond the command timeout is marked `error` by the stale-job sweep.
-- A command that exceeds `RUNLET_CMD_TIMEOUT` becomes `timeout`.
+- A command that exceeds `SASONICA_CMD_TIMEOUT` becomes `timeout`.
 - A bad signature or reused nonce becomes `rejected`.
 - A cancelled command becomes `cancelled`.
 - Partial output from a running command is copied to D1 periodically, so `get_result` can show progress before completion.
-- Finished rows are pruned daily after `RUNLET_KEEP_DAYS`; pending and running rows are never pruned.
+- Finished rows are pruned daily after `SASONICA_KEEP_DAYS`; pending and running rows are never pruned.
 
 Each claimed row records the runner name, normally the hostname. This keeps restart and stale-job cleanup scoped correctly when more than one runner uses a database.
 
@@ -163,56 +165,56 @@ Each claimed row records the runner name, normally the hostname. This keeps rest
 The normal local config lives in:
 
 ```text
-~/.config/runlet/env
-~/.config/runlet/relay.key
+~/.config/sasonica/env
+~/.config/sasonica/relay.key
 ```
 
 Useful runtime settings include:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `RUNLET_POLL` | `5` | Seconds between queue polls. |
-| `RUNLET_CMD_TIMEOUT` | `600` | Maximum command runtime in seconds. |
-| `RUNLET_MAX_OUTPUT` | `60000` | Maximum output bytes retained per command. |
-| `RUNLET_PARALLEL` | `1` | Foreground commands allowed to run at once. |
-| `RUNLET_BACKGROUND_MAX` | `4` | Maximum background jobs. |
-| `RUNLET_DETACH_CHECK` | `3` | Seconds between detach/cancel checks. |
-| `RUNLET_PROGRESS_EVERY` | `10` | Seconds between partial-output updates; `0` disables them. |
-| `RUNLET_KEEP_DAYS` | `30` | Days to retain finished rows. |
-| `RUNLET_LOAD_MAX` | `0` | Hold new work above this 1-minute load average; `0` disables the ceiling. |
-| `RUNLET_RUNNER_ID` | hostname | Name written on rows claimed by this runner. |
+| `SASONICA_POLL` | `5` | Seconds between queue polls. |
+| `SASONICA_CMD_TIMEOUT` | `600` | Maximum command runtime in seconds. |
+| `SASONICA_MAX_OUTPUT` | `60000` | Maximum output bytes retained per command. |
+| `SASONICA_PARALLEL` | `1` | Foreground commands allowed to run at once. |
+| `SASONICA_BACKGROUND_MAX` | `4` | Maximum background jobs. |
+| `SASONICA_DETACH_CHECK` | `3` | Seconds between detach/cancel checks. |
+| `SASONICA_PROGRESS_EVERY` | `10` | Seconds between partial-output updates; `0` disables them. |
+| `SASONICA_KEEP_DAYS` | `30` | Days to retain finished rows. |
+| `SASONICA_LOAD_MAX` | `0` | Hold new work above this 1-minute load average; `0` disables the ceiling. |
+| `SASONICA_RUNNER_ID` | hostname | Name written on rows claimed by this runner. |
 
-The Worker also supports `RUNLET_WAIT_DEFAULT` and `RUNLET_WAIT_MAX`; waits are capped at 30 seconds by the current Worker implementation so MCP clients are not left silent for too long.
+The Worker also supports `SASONICA_WAIT_DEFAULT` and `SASONICA_WAIT_MAX`; waits are capped at 30 seconds by the current Worker implementation so MCP clients are not left silent for too long.
 
 ## Operations
 
 Check recent commands:
 
 ```bash
-runlet status
-runlet status 30
+sasonica status
+sasonica status 30
 ```
 
 Follow the runner log:
 
 ```bash
-journalctl --user -u runlet -f
+journalctl --user -u sasonica-shell -f
 ```
 
 Inspect the service:
 
 ```bash
-systemctl --user status runlet
+systemctl --user status sasonica-shell
 ```
 
 Stop or start it:
 
 ```bash
-systemctl --user stop runlet
-systemctl --user start runlet
+systemctl --user stop sasonica-shell
+systemctl --user start sasonica-shell
 ```
 
-On macOS, use `launchctl print "gui/$(id -u)/org.runlet.runner"` and `tail -f "$HOME/Library/Logs/runlet/runner.log"`. See [SETUP.md](SETUP.md#everyday-operation) for stop/start commands. The Mac runs queued work while awake, online, and logged in.
+On macOS, use `launchctl print "gui/$(id -u)/com.sasonica.shell"` and `tail -f "$HOME/Library/Logs/sasonica/runner.log"`. See [SETUP.md](SETUP.md#everyday-operation) for stop/start commands. The Mac runs queued work while awake, online, and logged in.
 
 The signing compatibility test keeps the runner's OpenSSL implementation and the Worker's WebCrypto implementation pinned to the same vectors:
 
@@ -244,9 +246,9 @@ The CI matrix runs these checks on Linux and macOS, including the Mac's system B
 
 ## Deliberate non-features
 
-Runlet does **not** provide OAuth, per-client permissions, command allowlists, audit identity for which assistant queued a row, persistent shell sessions, or an agent runtime on the target machine.
+Sasonica Shell does **not** provide OAuth, per-client permissions, command allowlists, audit identity for which assistant queued a row, persistent shell sessions, or an agent runtime on the target machine.
 
-Those omissions are part of the design. If you need richer client identity, session routing, or multi-user policy, see [tmux-relay](https://github.com/davidj4tech/tmux-relay), the larger system from which Runlet was distilled. The two projects use the same command-signing scheme.
+Those omissions are part of the design. If you need richer client identity, session routing, or multi-user policy, see [tmux-relay](https://github.com/davidj4tech/tmux-relay), the larger system from which Sasonica Shell was distilled. The two projects use the same command-signing scheme.
 
 ## Repository map
 
@@ -254,16 +256,17 @@ Those omissions are part of the design. If you need richer client identity, sess
 |---|---|
 | `worker/src/index.ts` | Remote MCP Worker: four tools, signing, queueing, and result retrieval. |
 | `schema.sql` | D1 schema: one command table and its pending-row index. |
-| `runlet.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
+| `sasonica.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
 | `install.mjs` | The installer on every platform: provisioning, config, and the service. |
 | `install.sh` | Linux/macOS bootstrap: finds Node, hands over to `install.mjs`. |
-| `runlet.service` | systemd user-service template. |
+| `sasonica-shell.service` | systemd user-service template. |
 | `install.ps1` | Windows bootstrap: finds Node, hands over to `install.mjs`. |
 | `lib/service-systemd.mjs` | The systemd user service. |
 | `lib/service-macos.mjs` | The macOS LaunchAgent. |
 | `lib/service-windows.mjs` | The Windows Scheduled Task. |
 | `install.conf.example` | Optional non-interactive installer configuration. |
 | `SETUP.md` | Start-to-finish setup guide. |
+| `MIGRATING.md` | Moving an install made under the old name, Runlet, to Sasonica Shell. |
 | `tests/check-signing.sh` | Cross-implementation signing compatibility test. |
 | `tests/check-platform.py` | Installer routing and real job supervision, with external services mocked. |
 | `tests/check-runner.mjs` | The runner driven against the real Worker over real SQLite. |

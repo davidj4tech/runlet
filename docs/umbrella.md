@@ -1,11 +1,14 @@
 # One umbrella: app, tunnel, shell, installer (draft, 21 Sep 2026)
 
-David asked two things: should the Cloudflare Tunnel live in Runlet, and should
-the phone app and Runlet share one name. This is how the pieces sit.
+David asked two things: should the Cloudflare Tunnel live in Runlet (as the
+shell was then called), and should the phone app and the shell share one
+name. This is how the pieces sit.
 
-**Decided: the umbrella is Sasonica.** Runlet stays the name of the shell
-underneath ("Sasonica Shell, built on Runlet"). The name search that led back
-to Sasonica is kept at the end.
+**Decided: the umbrella is Sasonica, and the shell is Sasonica Shell.** The
+first version of this page kept Runlet as the shell's own name ("Sasonica
+Shell, built on Runlet"); that was reversed the same day in favour of a full
+rename, recorded in [Renaming the shell](#renaming-the-shell-21-sep-2026).
+The name search that led back to Sasonica is kept at the end, as history.
 
 ## The pieces
 
@@ -14,8 +17,8 @@ to Sasonica is kept at the end.
 | **Sasonica app** | Chat-first phone client (Capacitor 7 + assistant-ui + our Java audio) | phone | per-device app token | Sasonica (ABS fork) |
 | **Sasonica server** | agent-media's HTTP API: sessions, `/ask`, `/conversation`, `/targets`, speech, canvas | your machine | app token, checked server-side | agent-media (`MEDIA_SHARE_TOKEN`) |
 | **Sasonica link** | Cloudflare Tunnel publishing the server's HTTP port, so the app works off the tailnet | your machine (`cloudflared`) | tunnel token, scoped to one hostname | nothing (tailnet only) |
-| **Sasonica Shell** (Runlet) | The signed command queue for MCP assistants | Worker + D1 + `runlet.mjs` | runner token + secret connector URL | Runlet |
-| **installer** | One login to Cloudflare, then provision whichever pieces you ask for | your machine, once | OAuth (`wrangler login`), thrown away after | Runlet's `install.mjs` |
+| **Sasonica Shell** | The signed command queue for MCP assistants | Worker + D1 + `sasonica.mjs` | runner token + secret connector URL | Sasonica Shell (was Runlet) |
+| **installer** | One login to Cloudflare, then provision whichever pieces you ask for | your machine, once | OAuth (`wrangler login`), thrown away after | `install.mjs` in the shell's repo, reached as `sasonica install` |
 
 ## Rules that keep it safe
 
@@ -46,11 +49,15 @@ Tunnel keeps agent-media's HTTP/SSE as it is and only changes how it is reached.
 ```
 sasonica install            # asks which pieces
 sasonica install link       # cloudflared + tunnel + DNS + Access policy
-sasonica install shell      # today's Runlet: Worker, D1, runner service
+sasonica install shell      # the shell: Worker, D1, runner service
 sasonica pair               # shows a QR: hostname + app token, scanned by the app
 ```
 
-What it shares with today's Runlet: account discovery, the OAuth login instead
+`sasonica install` and `sasonica install shell` exist today and are the same
+thing, since the shell is the only piece there is; `link` and `pair` are not
+built, and `sasonica install link` says so rather than installing the shell.
+
+What the rest will share with today's shell installer: account discovery, the OAuth login instead
 of a hand-built token, service install per platform (systemd / launchd / Task
 Scheduler), the restart-not-enable lesson.
 
@@ -68,20 +75,45 @@ link lives under sasonica.com, already an active zone in his account.
 
 Keep the code where it is; share a name, not a monorepo:
 
-- `runlet` — installer + shell + link provisioning (the installer answers to
-  `sasonica`; the shell keeps `runlet`)
+- `runlet` — installer + shell + link provisioning. The repo keeps its
+  GitHub name for now; everything in it answers to `sasonica`.
 - `agent-media` — server
 - `Sasonica` — app repo; the ABS fork history gives way to the new app
 
-## No rename
+## The app keeps its name
 
-The name stays; only what is behind it changes. `applicationId` stays
+Sasonica stays; only what is behind it changes. `applicationId` stays
 `com.sasonica.app`, so the app updates in place with no reinstall. The GPL
 leaves with the ABS-derived code at the ABS exit, so the name carries on under
 a liberal licence. Tagline to carry the meaning a coined name can't:
 "Talk to your agents".
 
+## Renaming the shell (21 Sep 2026)
+
+**Reversed the same day: the shell is renamed outright, not "built on
+Runlet".** The earlier call (above, and in the name check below) was to keep
+Runlet as the shell's name, which would have meant carrying two names, or a
+compatibility layer that read both. David's reason for reversing it: there are
+only one or two installs, both his, so there is nobody to stay compatible for.
+Do it right once, while it is cheap.
+
+What changed: the command (`sasonica`), the runner (`sasonica.mjs`), every
+`RUNLET_*` setting and Worker secret (now `SASONICA_*`), the config and state
+directories (`~/.config/sasonica`, `%APPDATA%\sasonica`), the service
+(`sasonica-shell.service`, launchd `com.sasonica.shell`, Scheduled Task
+`sasonica-shell`), the Worker and D1 names (`sasonica-shell-<site>`) and the
+MCP `serverInfo` (`sasonica-shell`, "Sasonica Shell").
+
+What did not: the HMAC signing scheme and its test vectors (tmux-relay's
+d1-runner scheme, byte for byte; a scheme is not a name), `relay.key`, the four
+tool names, the D1 table, the LICENSE, and for now the GitHub repo name. An
+existing install moves across with `MIGRATING.md`: a new Worker and database
+under the new name, then the old ones deleted.
+
 ## Name check: "Runlet" (21 Sep 2026)
+
+History. Its verdict, keeping "Runlet" as the shell's name, was superseded by
+the rename above; the collisions it lists are part of why that was easy.
 
 Crowded, and one collision is close to exactly what we would be.
 
@@ -195,7 +227,8 @@ YouTube handle and an antique silver pot: no software product.
 
 The only thing that tied it to Audiobookshelf was the fork, which is going. If
 kept: Sasonica is the umbrella and the app; Runlet stays the shell's name
-("Sasonica Shell, built on Runlet"); the link hostname lives under
+("Sasonica Shell, built on Runlet" -- later reversed, see Renaming the shell);
+the link hostname lives under
 sasonica.com; the `applicationId` can stay `com.sasonica.app`, so no reinstall.
 
 ## Related

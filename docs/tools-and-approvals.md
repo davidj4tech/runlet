@@ -1,6 +1,6 @@
 # Typed tools, phone approvals, and assistants as threads (proposal, 21 Sep 2026)
 
-Status: **proposal, nothing built.** How Runlet and the assistants that use it
+Status: **proposal, nothing built.** How Sasonica Shell and the assistants that use it
 (Claude.ai, ChatGPT custom connectors, any remote MCP host) fit into the
 Sasonica umbrella (`umbrella.md`) beyond "a shell with a skills list".
 
@@ -14,11 +14,11 @@ soon; they reinforce each other.
 - The skills directory tells it what is worth running. On red5 today:
   `agent-mail`, `agent-memory-search`, `claude-sessions`, `music`,
   `music-transit`, `red5-map`, `speak`. To use one, the assistant runs
-  `runlet skills`, reads a SKILL.md, then composes a shell command from the
+  `sasonica skills`, reads a SKILL.md, then composes a shell command from the
   prose. That is three round trips before the first useful call, and the
   command is free text every time.
 - **The HMAC protects D1, not the Worker.** The Worker holds
-  `RUNLET_HMAC_KEY` and signs whatever the secret URL asks for. So whoever
+  `SASONICA_HMAC_KEY` and signs whatever the secret URL asks for. So whoever
   holds the URL has a shell, and nothing on the runner can tell a legitimate
   row from one queued by a leaked URL. The README says so plainly ("no
   command allowlist"). Everything below keeps that true for `run_command`
@@ -35,7 +35,7 @@ shell**.
 
 A sidecar, not new keys in SKILL.md: those files are shared with Claude
 Code and the other harnesses through agent-config, and they are read as
-prose. `~/.config/runlet/tools/<skill>.json`:
+prose. `~/.config/sasonica/tools/<skill>.json`:
 
 ```json
 {
@@ -116,7 +116,7 @@ commands.
 
 ### Policy
 
-`~/.config/runlet/policy.json`, read by the runner:
+`~/.config/sasonica/policy.json`, read by the runner:
 
 ```json
 {
@@ -154,25 +154,25 @@ sees the final status. A leaked URL can queue rows, but approving them
 takes the phone.
 
 Without agent-media installed, `approve` falls back to a desktop
-notification with a local confirm command (`runlet approve 42`) — so
-Runlet stays usable on its own, as its README promises.
+notification with a local confirm command (`sasonica approve 42`) — so
+Sasonica Shell stays usable on its own, as its README promises.
 
 ## 3. Assistants as threads in the app
 
-**Idea:** what a third-party assistant does through Runlet shows up in the
+**Idea:** what a third-party assistant does through Sasonica Shell shows up in the
 Sasonica app as a thread, next to the desk's Claude Code sessions. The phone
 becomes the one place to see what every agent is doing.
 
-- **Who asked.** Runlet cannot say today (the README lists "no audit
+- **Who asked.** Sasonica Shell cannot say today (the README lists "no audit
   identity" as a non-goal). The cheap fix: **one connector URL per
-  client**. `RUNLET_URL_SECRET` becomes a small table of `(secret,
+  client**. `SASONICA_URL_SECRET` becomes a small table of `(secret,
   client_label)` — `claude.ai`, `chatgpt`, `phone-claude`. Each row records
   its client. It also gives per-client revocation, which today means
   rotating the one secret everyone shares.
 - **The thread.** The runner already sees every row. It appends each row
   (client, command or tool call, status, trimmed output) to a local
   journal, and agent-media reads that journal as a thread source. In
-  `/targets` the thread is "Runlet · claude.ai", and each row is a message:
+  `/targets` the thread is "Sasonica Shell · claude.ai", and each row is a message:
   the command as the user turn, the output as the reply. The thread is
   read-only in v1. Replying from the app would mean pushing text back into
   a third-party chat, and nothing supports that.
@@ -204,9 +204,9 @@ override: `"tool_overrides": {"claude_sessions__ask_session": "approve"}`.
 
 The runner polls the Worker, and the Worker reads D1 on every poll. The
 tmux-relay's poll ran D1 out of daily reads once (agent-media memory
-`d1-quota-clips-silently`); Runlet has the same shape.
+`d1-quota-clips-silently`); Sasonica Shell has the same shape.
 
-**A Durable Object per runner**, holding a WebSocket from `runlet.mjs`:
+**A Durable Object per runner**, holding a WebSocket from `sasonica.mjs`:
 - the Worker notifies the DO when it enqueues a row;
 - the DO pushes "work available" down the socket;
 - the runner claims as it does now.
@@ -231,6 +231,6 @@ but it is the one that makes interactive use (§4) feel immediate.
 
 - **A command allowlist in the Worker.** The Worker is exactly the party
   that cannot be trusted with the decision; the runner is.
-- **Folding the Sasonica link into Runlet.** Settled in `umbrella.md`: two
+- **Folding the Sasonica link into Sasonica Shell.** Settled in `umbrella.md`: two
   transports, two credentials, two off switches.
 - **Persistent shells.** Still out, for the reasons in the README.
