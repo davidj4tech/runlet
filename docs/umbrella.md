@@ -1,17 +1,20 @@
 # One umbrella: app, tunnel, shell, installer (draft, 21 Sep 2026)
 
 David asked two things: should the Cloudflare Tunnel live in Runlet, and should
-Sasonica be renamed into the same family. This is how the pieces would sit.
-"<Name>" stands for the umbrella; see the name check below before picking it.
+the phone app and Runlet share one name. This is how the pieces sit.
+
+**Decided: the umbrella is Sasonica.** Runlet stays the name of the shell
+underneath ("Sasonica Shell, built on Runlet"). The name search that led back
+to Sasonica is kept at the end.
 
 ## The pieces
 
 | Piece | What it is | Runs where | Credential | Exists today as |
 | --- | --- | --- | --- | --- |
-| **<Name> app** | Chat-first phone client (Capacitor 7 + assistant-ui + our Java audio) | phone | per-device app token | Sasonica (ABS fork) |
-| **<Name> server** | agent-media's HTTP API: sessions, `/ask`, `/conversation`, `/targets`, speech, canvas | your machine | app token, checked server-side | agent-media (`MEDIA_SHARE_TOKEN`) |
-| **<Name> link** | Cloudflare Tunnel publishing the server's HTTP port, so the app works off the tailnet | your machine (`cloudflared`) | tunnel token, scoped to one hostname | nothing (tailnet only) |
-| **<Name> shell** | The signed command queue for MCP assistants | Worker + D1 + `runlet.mjs` | runner token + secret connector URL | Runlet |
+| **Sasonica app** | Chat-first phone client (Capacitor 7 + assistant-ui + our Java audio) | phone | per-device app token | Sasonica (ABS fork) |
+| **Sasonica server** | agent-media's HTTP API: sessions, `/ask`, `/conversation`, `/targets`, speech, canvas | your machine | app token, checked server-side | agent-media (`MEDIA_SHARE_TOKEN`) |
+| **Sasonica link** | Cloudflare Tunnel publishing the server's HTTP port, so the app works off the tailnet | your machine (`cloudflared`) | tunnel token, scoped to one hostname | nothing (tailnet only) |
+| **Sasonica Shell** (Runlet) | The signed command queue for MCP assistants | Worker + D1 + `runlet.mjs` | runner token + secret connector URL | Runlet |
 | **installer** | One login to Cloudflare, then provision whichever pieces you ask for | your machine, once | OAuth (`wrangler login`), thrown away after | Runlet's `install.mjs` |
 
 ## Rules that keep it safe
@@ -41,10 +44,10 @@ Tunnel keeps agent-media's HTTP/SSE as it is and only changes how it is reached.
 ## Installer shape
 
 ```
-<name> install            # asks which pieces
-<name> install link       # cloudflared + tunnel + DNS + Access policy
-<name> install shell      # today's Runlet: Worker, D1, runner service
-<name> pair               # shows a QR: hostname + app token, scanned by the app
+sasonica install            # asks which pieces
+sasonica install link       # cloudflared + tunnel + DNS + Access policy
+sasonica install shell      # today's Runlet: Worker, D1, runner service
+sasonica pair               # shows a QR: hostname + app token, scanned by the app
 ```
 
 What it shares with today's Runlet: account discovery, the OAuth login instead
@@ -58,22 +61,25 @@ two-permission floor was verified (`795a406`).
 
 Open question: a user with no Cloudflare account and no domain. Tunnel needs a
 zone; quick tunnels (`trycloudflare.com`) are unauthenticated and ephemeral, so
-not suitable. Tailscale-only stays a supported mode for that user.
+not suitable. Tailscale-only stays a supported mode for that user. David's own
+link lives under sasonica.com, already an active zone in his account.
 
 ## Repos
 
 Keep the code where it is; share a name, not a monorepo:
 
-- `runlet` (or the umbrella's name) — installer + shell + link provisioning
+- `runlet` — installer + shell + link provisioning (the installer answers to
+  `sasonica`; the shell keeps `runlet`)
 - `agent-media` — server
-- `sasonica` → app repo, renamed at the ABS exit
+- `Sasonica` — app repo; the ABS fork history gives way to the new app
 
-## The rename
+## No rename
 
-Do it at the ABS exit, before anyone else installs the app: a new
-`applicationId` means a fresh install and lost local state, which costs nothing
-now and a lot later. The GPL leaves with the ABS-derived code at the same
-moment, so the new name starts clean.
+The name stays; only what is behind it changes. `applicationId` stays
+`com.sasonica.app`, so the app updates in place with no reinstall. The GPL
+leaves with the ABS-derived code at the ABS exit, so the name carries on under
+a liberal licence. Tagline to carry the meaning a coined name can't:
+"Talk to your agents".
 
 ## Name check: "Runlet" (21 Sep 2026)
 
