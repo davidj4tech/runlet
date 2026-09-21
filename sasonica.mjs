@@ -16,6 +16,8 @@
 //         sasonica --once        one poll, for testing
 //         sasonica status [n]    the last n rows (default 10), newest first
 //         sasonica skills        the skills listed in SASONICA_SKILLS_DIR
+//         sasonica client add|list|revoke [label]
+//                                per-assistant connector URLs (lib/clients.mjs)
 //         sasonica sign <nonce> <command>
 //         sasonica install [shell] [--no-service|--print-url]
 //                                hand over to install.mjs beside this file
@@ -31,6 +33,7 @@ import { homedir, hostname, loadavg } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { renderShim } from './lib/install-lib.mjs';
+import { clientCommand } from './lib/clients.mjs';
 
 const WIN = process.platform === 'win32';
 // This file, for `sasonica install` (install.mjs sits beside it) and for the
@@ -147,7 +150,10 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
   console.log(`sasonica: Sasonica Shell runs signed shell commands queued by an assistant, on this machine.
 
   sasonica skills        the tools the owner has set up here, and where to read about each
-  sasonica status [n]    the last n rows (default 10), newest first
+  sasonica status [n]    the last n rows (default 10), newest first, with who queued each
+  sasonica client add <label> | list | revoke <label>
+                         one connector URL per assistant, each revocable on its own
+                         (needs the installer's Cloudflare token, not the runner's)
   sasonica --once        one poll, then exit
   sasonica               poll forever (what the service runs)
   sasonica sign <nonce> <command>   the signature this runner expects
@@ -241,6 +247,15 @@ if (sub === 'skills') {
   process.exit(0);
 }
 
+// `client`: per-assistant connector URLs. Before the runner-token check on
+// purpose -- it does not use the runner's credential at all, but the
+// Cloudflare token the installer used (lib/clients.mjs says why).
+if (sub === 'client') {
+  process.exit(await clientCommand(rest, {
+    cfg, conf: CONF, wordsFile: path.join(path.dirname(SELF), 'words.txt'),
+  }));
+}
+
 // The runner token goes on every request, so the Worker URL must be https --
 // over plaintext to anything but this machine it would be handed to whoever
 // is listening. Loopback is allowed because the tests serve the real Worker
@@ -266,8 +281,11 @@ if (sub === 'status') {
   const { rows } = await api('status', { limit });
   for (const r of rows) {
     const code = r.exit_code === null ? '' : ` exit=${r.exit_code}`;
-    console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${r.command}`);
-    console.log(`\t\t\t${r.output ?? ''}`);
+    // client/agent: which URL queued it, and what the assistant called
+    // itself. Rows from before either was recorded show '-'.
+    const who = `${r.client ?? '-'}/${r.agent ?? '-'}`;
+    console.log(`#${r.id}\t${r.status}${code}\t${r.updated_at}\t${who}\t${r.command}`);
+    console.log(`\t\t\t\t${r.output ?? ''}`);
   }
   process.exit(0);
 }

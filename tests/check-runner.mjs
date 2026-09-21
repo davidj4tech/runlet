@@ -15,12 +15,14 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { fakeD1, sign } from './fake-d1.mjs';
 
 // The runner is driven against the REAL Worker, over real SQLite: no mock of
 // the protocol sits between them, so a change to either side that breaks the
 // other fails here.
-const worker = (await import('../worker/src/index.ts')).default;
+const workerModule = await import('../worker/src/index.ts');
+const worker = workerModule.default;
 const RUNNER_TOKEN = 'runner-token-under-test';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -131,6 +133,84 @@ async function serveWorker(rows) {
   const url = `http://127.0.0.1:${server.address().port}`;
   process.on('exit', () => server.close());
   return { db, url, stop: () => server.close() };
+}
+
+// A stand-in for Cloudflare's D1 HTTP API, over the same SQLite the Worker
+// reads, so `sasonica client` writes rows the real Worker then honours. It
+// checks the bearer token and the ids in the path as Cloudflare would, and
+// counts requests, so a case can show that nothing was sent at all.
+const CF_TOKEN = 'cloudflare-token-under-test';
+async function serveCloudflare(db) {
+  const seen = { requests: 0, auth: [] };
+  const server = createServer(async (req, res) => {
+    seen.requests++;
+    seen.auth.push(req.headers.authorization ?? '');
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const reply = (status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+    if (req.headers.authorization !== `Bearer ${CF_TOKEN}`) {
+      return reply(403, { success: false, errors: [{ message: 'Authentication error' }] });
+    }
+    if (req.method !== 'POST' || req.url !== '/client/v4/accounts/acct-test/d1/database/db-test/query') {
+      return reply(404, { success: false, errors: [{ message: `no route ${req.url}` }] });
+    }
+    const { sql, params = [] } = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    try {
+      const st = db.db.prepare(sql);
+      let results = [], meta = {};
+      if (/RETURNING|^\s*(SELECT|PRAGMA)/is.test(sql)) results = st.all(...params);
+      else { const info = st.run(...params); meta = { changes: Number(info.changes), last_row_id: Number(info.lastInsertRowid) }; }
+      reply(200, { success: true, errors: [], result: [{ success: true, results, meta }] });
+    } catch (e) {
+      reply(400, { success: false, errors: [{ message: e.message }] });
+    }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  process.on('exit', () => server.close());
+  return { seen, api: `http://127.0.0.1:${server.address().port}/client/v4` };
+}
+
+// `sasonica client ...` as a real child process. Asynchronous on purpose: the
+// fake API above answers from this process's event loop, which a sync spawn
+// would block.
+function runCli(argv, env) {
+  return new Promise((res) => {
+    const p = spawn(process.execPath, [RUNNER, 'client', ...argv], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '', err = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('close', (code) => res({ code, out, err }));
+  });
+}
+
+// A config directory as the installer leaves it, plus whatever a case adds.
+function clientConf(extra = {}) {
+  const conf = mkdtempSync(path.join(tmpdir(), 'sasonica-clients-'));
+  process.on('exit', () => rmSync(conf, { recursive: true, force: true }));
+  writeFileSync(path.join(conf, 'env'), Object.entries({
+    CLOUDFLARE_ACCOUNT_ID: 'acct-test', SASONICA_DB_ID: 'db-test',
+    SASONICA_WORKER_URL: 'https://shell.example.workers.dev', SASONICA_URL_SECRET: 'shared-url-secret',
+    SASONICA_RUNNER_TOKEN: RUNNER_TOKEN, ...extra,
+  }).map(([k, v]) => `${k}=${v}`).join('\n') + '\n');
+  return conf;
+}
+const cliEnv = (conf, api, extra = {}) => {
+  const env = { ...process.env, SASONICA_CONF: conf, SASONICA_CF_API: api, ...extra };
+  if (!('CLOUDFLARE_API_TOKEN' in extra)) delete env.CLOUDFLARE_API_TOKEN;
+  return env;
+};
+
+// One MCP call through the real Worker, over the same database, with a cold
+// client cache -- what a fresh isolate would answer.
+async function mcpStatus(db, secret, shared = 'shared-url-secret') {
+  workerModule.resetClientCache();
+  const env = { DB: db.binding, SASONICA_HMAC_KEY: KEY, SASONICA_URL_SECRET: shared, SASONICA_RUNNER_TOKEN: RUNNER_TOKEN };
+  const r = await worker.fetch(new Request(`https://w.example/${secret}/mcp`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call',
+      params: { name: 'run_command', arguments: { command: 'true', wait: 0 } } }),
+  }), env);
+  return r.status;
 }
 
 // Spawn the runner the way a service manager does: its own process, its own
@@ -443,6 +523,7 @@ const cases = {
       { ...job('echo one'), status: 'done', exit_code: 0, output: 'first\nsecond', runner: 'w' },
       { ...job('echo two'), status: 'running', runner: 'w' },
     ]);
+    db.db.prepare(`UPDATE commands SET client = 'default', agent = 'claude-ai' WHERE id = 2`).run();
     const env = {
       DB: db.binding, SASONICA_HMAC_KEY: KEY,
       SASONICA_URL_SECRET: 'unused-here', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN,
@@ -457,10 +538,124 @@ const cases = {
     catch (e) { if (e.message !== '__exit__') throw e; }
     finally { console.log = realLog; process.exit = realExit; }
     // Newest first, and a row still running has no exit code to show.
-    assert.match(out[0], /^#2\trunning\t/);
+    assert.match(out[0], /^#2\trunning\t\S+ \S+\tdefault\/claude-ai\techo two$/);
     assert.ok(!/exit=/.test(out[0]), `a running row must not show an exit code: ${out[0]}`);
-    assert.match(out[2], /^#1\tdone exit=0\t/);
+    assert.match(out[2], /^#1\tdone exit=0\t\S+ \S+\t-\/-\t/, 'a row from before attribution shows -/-');
     assert.match(out[3], /first \| second/);      // newlines folded onto one line
+  },
+};
+
+// --- sasonica client ----------------------------------------------------------
+const clientCases = {
+  // The whole life of a per-client URL: minted, used, listed, revoked,
+  // reissued -- with the real Worker deciding whether each URL works.
+  async clientAddListRevoke() {
+    const db = fakeD1([]);
+    const { api } = await serveCloudflare(db);
+    const conf = clientConf();
+    writeFileSync(path.join(conf, 'install-token'), `${CF_TOKEN}\n`);
+    const env = cliEnv(conf, api);
+
+    const added = await runCli(['add', 'chatgpt'], env);
+    assert.equal(added.code, 0, added.err);
+    const url = /(https:\/\/\S+\/mcp)/.exec(added.out)?.[1];
+    assert.ok(url?.startsWith('https://shell.example.workers.dev/'), `no URL printed: ${added.out}`);
+    const secret = url.split('/').at(-2);
+    // Only the hash is stored.
+    const row = db.db.prepare(`SELECT * FROM clients WHERE label = 'chatgpt'`).get();
+    assert.equal(row.secret_sha256, createHash('sha256').update(secret).digest('hex'));
+    assert.equal(row.revoked_at, null);
+
+    assert.equal(await mcpStatus(db, secret), 200, 'the new URL should work at once');
+    assert.equal(db.row(1).client, 'chatgpt');
+
+    const dup = await runCli(['add', 'chatgpt'], env);
+    assert.equal(dup.code, 1);
+    assert.match(dup.err, /already has a working URL/);
+
+    const listed = await runCli(['list'], env);
+    assert.equal(listed.code, 0, listed.err);
+    assert.match(listed.out, /^default\s+\(shared URL\)\s+-\s+-$/m);
+    assert.match(listed.out, /^chatgpt\s+\d{4}-\d\d-\d\d \S+\s+-\s+\d{4}-\d\d-\d\d/m, 'last used should show the row it queued');
+    assert.ok(!listed.out.includes(secret), 'list must never show a secret');
+
+    const revoked = await runCli(['revoke', 'chatgpt'], env);
+    assert.equal(revoked.code, 0, revoked.err);
+    assert.match(revoked.out, /within 30 s/);
+    assert.equal(await mcpStatus(db, secret), 404, 'a revoked URL must stop working');
+    assert.equal(await mcpStatus(db, 'shared-url-secret'), 200, 'the shared URL is untouched');
+    assert.match((await runCli(['list'], env)).out, /^chatgpt\s+\S+ \S+\s+\d{4}-/m);
+    const again = await runCli(['revoke', 'chatgpt'], env);
+    assert.equal(again.code, 1);
+    assert.match(again.err, /already revoked/);
+
+    // Reissuing a revoked label: a new secret, and the old one stays dead.
+    const reissued = await runCli(['add', 'chatgpt'], env);
+    assert.equal(reissued.code, 0, reissued.err);
+    const secret2 = /\/([^/\s]+)\/mcp/.exec(reissued.out)[1];
+    assert.notEqual(secret2, secret);
+    assert.equal(await mcpStatus(db, secret2), 200);
+    assert.equal(await mcpStatus(db, secret), 404);
+  },
+
+  // Revoking the shared URL leaves per-client ones working, and rotating
+  // SASONICA_URL_SECRET brings a shared URL back.
+  async clientRevokeDefault() {
+    const db = fakeD1([]);
+    const { api } = await serveCloudflare(db);
+    const conf = clientConf();
+    const env = cliEnv(conf, api, { CLOUDFLARE_API_TOKEN: CF_TOKEN });
+    const added = await runCli(['add', 'laptop'], env);
+    const laptop = /\/([^/\s]+)\/mcp/.exec(added.out)[1];
+    const r = await runCli(['revoke', 'default'], env);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(await mcpStatus(db, 'shared-url-secret'), 404);
+    assert.equal(await mcpStatus(db, laptop), 200);
+    assert.match((await runCli(['list'], env)).out, /^default\s+\(shared URL\)\s+\d{4}-/m);
+    assert.equal(await mcpStatus(db, 'rotated-shared-secret', 'rotated-shared-secret'), 200,
+      'a rotated shared secret is not covered by the old revocation');
+  },
+
+  // Refused before anything is sent: a bad label, 'default' as a new client,
+  // and no installer token -- the runner's own token, which IS in the env
+  // file, must not stand in for it.
+  async clientRefusals() {
+    const db = fakeD1([]);
+    const { api, seen } = await serveCloudflare(db);
+    const conf = clientConf();
+    const env = cliEnv(conf, api, { CLOUDFLARE_API_TOKEN: CF_TOKEN });
+    for (const bad of ['Upper', 'has space', 'x'.repeat(33), '']) {
+      const r = await runCli(['add', bad], env);
+      assert.equal(r.code, 2, `label '${bad}' should be refused`);
+    }
+    assert.equal((await runCli(['add', 'default'], env)).code, 2);
+    assert.equal((await runCli(['frobnicate'], env)).code, 2);
+    assert.equal(seen.requests, 0, 'nothing should reach the API for a refused command');
+
+    const noToken = await runCli(['add', 'phone'], cliEnv(conf, api));
+    assert.equal(noToken.code, 1);
+    assert.match(noToken.err, /install-token/);
+    assert.match(noToken.err, /runner's own token cannot do this/);
+    assert.equal(seen.requests, 0, 'with no installer token, no request at all');
+
+    const plaintext = await runCli(['list'], cliEnv(conf, 'http://api.example.com/client/v4', { CLOUDFLARE_API_TOKEN: CF_TOKEN }));
+    assert.equal(plaintext.code, 1);
+    assert.match(plaintext.err, /must be https/);
+  },
+
+  // The runner's bearer token has no way to reach the clients table: the
+  // Worker's runner API has no op for it.
+  async runnerTokenCannotMintUrls() {
+    const db = fakeD1([]);
+    const env = { DB: db.binding, SASONICA_HMAC_KEY: KEY, SASONICA_URL_SECRET: 's', SASONICA_RUNNER_TOKEN: RUNNER_TOKEN };
+    for (const op of ['client', 'clients', 'add_client']) {
+      const r = await worker.fetch(new Request('https://w.example/runner', {
+        method: 'POST', headers: { authorization: `Bearer ${RUNNER_TOKEN}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ op, label: 'x', secret_sha256: 'y' }),
+      }), env);
+      assert.equal(r.status, 400);
+    }
+    assert.equal(db.db.prepare('SELECT count(*) AS n FROM clients').get().n, 0);
   },
 };
 
@@ -516,7 +711,7 @@ const cliCases = {
 };
 
 // --- driver ------------------------------------------------------------------
-const all = { ...cases, ...cliCases };
+const all = { ...cases, ...clientCases, ...cliCases };
 const name = process.argv[2];
 
 if (name) {

@@ -24,13 +24,13 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync, rmSync }
 import { homedir, hostname, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { cfRequest } from './lib/cloudflare.mjs';
 import { hex, siteName, urlSecret, readEnvFile, renderEnv, renderShim,
          winShellCommand, needsWindowsShell } from './lib/install-lib.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WIN = process.platform === 'win32';
 const MAC = process.platform === 'darwin';
-const API = 'https://api.cloudflare.com/client/v4';
 
 const say = (m) => console.log(`\n${WIN ? '' : '\x1b[1m'}==> ${m}${WIN ? '' : '\x1b[0m'}`);
 const note = (m) => console.log(`    ${m}`);
@@ -79,18 +79,9 @@ async function ask(question, { hidden = false } = {}) {
 }
 
 // --- Cloudflare ---------------------------------------------------------------
-async function cf(pathname, { method = 'GET', body, token } = {}) {
-  const r = await fetch(`${API}${pathname}`, {
-    method,
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    ...(body ? { body: JSON.stringify(body) } : {}),
-    signal: AbortSignal.timeout(60_000),
-  });
-  const out = await r.json().catch(() => null);
-  if (!out?.success) {
-    die(`Cloudflare: ${(out?.errors ?? []).map((e) => e.message).join('; ') || r.status}`);
-  }
-  return out.result;
+// lib/cloudflare.mjs, shared with `sasonica client`; here a failure ends the install.
+async function cf(pathname, opts = {}) {
+  try { return await cfRequest(pathname, opts); } catch (e) { return die(e.message); }
 }
 
 // --- secrets -------------------------------------------------------------------
@@ -226,7 +217,10 @@ if (wrangler(['d1', 'execute', dbName, '--remote', '--file', path.join(HERE, 'sc
 // ALTER TABLE is not idempotent in SQLite, so look first.
 const cols = wrangler(['d1', 'execute', dbName, '--remote', '--json', '--command', 'PRAGMA table_info(commands);'],
   { capture: true }).out;
-for (const spec of ['background INTEGER NOT NULL DEFAULT 0', 'cancel INTEGER NOT NULL DEFAULT 0', 'runner TEXT']) {
+// client and agent say who queued a row; the clients table they refer to is
+// in schema.sql as CREATE TABLE IF NOT EXISTS, so it arrived with the file.
+for (const spec of ['background INTEGER NOT NULL DEFAULT 0', 'cancel INTEGER NOT NULL DEFAULT 0', 'runner TEXT',
+                    'client TEXT', 'agent TEXT']) {
   const col = spec.split(' ')[0];
   if (!new RegExp(`"name"\\s*:\\s*"${col}"`).test(cols)) {
     if (wrangler(['d1', 'execute', dbName, '--remote', '--command', `ALTER TABLE commands ADD COLUMN ${spec};`],
