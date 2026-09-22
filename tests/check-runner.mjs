@@ -511,7 +511,7 @@ const cases = {
     const env = { ...process.env, SASONICA_CONF: empty, HOME: empty, USERPROFILE: empty };
     delete env.SASONICA_KEY;
     const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
-    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica url', 'sasonica install', 'sasonica pair', 'SASONICA_WORKER_URL']) {
+    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica url', 'sasonica install', 'sasonica pair', 'sasonica devices', 'SASONICA_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
     rmSync(empty, { recursive: true, force: true });
@@ -708,7 +708,7 @@ const cliCases = {
     rmSync(tmp, { recursive: true, force: true });
   },
 
-  // `sasonica pair` is agent-media's `media-visual-canvas pair` under the
+  // `sasonica pair` (and `devices`) is agent-media's `media-visual-canvas pair` under the
   // umbrella's name: it hands over with the arguments intact and the exit
   // status kept, and says what is missing when agent-media is not installed.
   pairHandsOver() {
@@ -720,6 +720,8 @@ const cliCases = {
     const r = spawnSync(process.execPath, [RUNNER, 'pair', '--device', 'Pixel 8a'], { env, encoding: 'utf8' });
     assert.equal(r.stdout.trim(), 'args: pair --device Pixel 8a');
     assert.equal(r.status, 3);
+    const dev = spawnSync(process.execPath, [RUNNER, 'devices', '--revoke', 'abc'], { env, encoding: 'utf8' });
+    assert.equal(dev.stdout.trim(), 'args: devices --revoke abc');
     const none = spawnSync(process.execPath, [RUNNER, 'pair'],
       { env: { ...process.env, PATH: bin + '-missing' }, encoding: 'utf8' });
     assert.equal(none.status, 1);

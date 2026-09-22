@@ -169,6 +169,8 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
   sasonica pair [--device <name>]
                          a one-time pairing link + QR: a browser by default, the
                          app with --device (agent-media's media-visual-canvas pair)
+  sasonica devices [--revoke <id>]
+                         the paired apps, or forget one (its token stops working)
 
 Config: ${ENV_FILE}
   SASONICA_WORKER_URL     this machine's Worker
@@ -217,18 +219,19 @@ if (sub === 'install') {
   process.exit(r.status ?? 1);
 }
 
-// `sasonica pair`: the umbrella's pairing entry (docs/umbrella.md). Pairing
-// lives in agent-media's canvas, which owns the codes and the tokens they
-// unlock, so this hands over to `media-visual-canvas pair`, arguments and all:
-// one name to remember, one implementation.
-if (sub === 'pair') {
-  const r = spawnSync('media-visual-canvas', ['pair', ...rest], { stdio: 'inherit' });
+// `sasonica pair` / `sasonica devices`: the umbrella's pairing entry
+// (docs/umbrella.md) and its other half, listing and revoking what was paired.
+// Pairing lives in agent-media's canvas, which owns the codes and the tokens
+// they unlock, so these hand over to `media-visual-canvas <sub>`, arguments
+// and all: one name to remember, one implementation.
+if (sub === 'pair' || sub === 'devices') {
+  const r = spawnSync('media-visual-canvas', [sub, ...rest], { stdio: 'inherit' });
   if (r.error?.code === 'ENOENT') {
-    console.error('sasonica pair: media-visual-canvas is not on PATH; '
+    console.error(`sasonica ${sub}: media-visual-canvas is not on PATH; `
       + 'pairing needs agent-media on this machine');
     process.exit(1);
   }
-  if (r.error) { console.error(`sasonica pair: ${r.error.message}`); process.exit(1); }
+  if (r.error) { console.error(`sasonica ${sub}: ${r.error.message}`); process.exit(1); }
   process.exit(r.status ?? 1);
 }
 

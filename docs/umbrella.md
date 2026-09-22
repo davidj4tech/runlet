@@ -57,7 +57,8 @@ sasonica pair               # shows a QR: hostname + app token, scanned by the a
 thing, since the shell is the only piece there is; `link` is not built, and
 `sasonica install link` says so rather than installing the shell.
 `sasonica pair` exists and hands over to agent-media's `media-visual-canvas
-pair`: a one-time link and QR for a browser, or for the app with `--device`.
+pair`: a one-time link and QR for a browser, or for the app with `--device`;
+`sasonica devices [--revoke <id>]` lists or forgets the paired apps.
 
 What the rest will share with today's shell installer: account discovery, the OAuth login instead
 of a hand-built token, service install per platform (systemd / launchd / Task
