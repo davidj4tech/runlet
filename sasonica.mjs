@@ -166,6 +166,9 @@ if (sub === '--help' || sub === '-h' || sub === 'help') {
   sasonica sign <nonce> <command>   the signature this runner expects
   sasonica install [shell] [--no-service|--print-url]
                          set up or repair this machine (install.mjs)
+  sasonica pair [--device <name>]
+                         a one-time pairing link + QR: a browser by default, the
+                         app with --device (agent-media's media-visual-canvas pair)
 
 Config: ${ENV_FILE}
   SASONICA_WORKER_URL     this machine's Worker
@@ -199,7 +202,7 @@ if (sub === 'sign') {
 // the shell exists to install today, so `install` and `install shell` are the
 // same thing, and both are install.mjs beside this file -- the command a
 // person already has, rather than a path into the checkout they have to
-// remember. The other pieces the umbrella sketches (link, pair) are refused
+// remember. The piece the umbrella sketches that is not built (link) is refused
 // by name rather than silently installing the shell instead.
 if (sub === 'install') {
   const args = rest[0] === 'shell' ? rest.slice(1) : rest;
@@ -211,6 +214,21 @@ if (sub === 'install') {
   const installer = path.join(path.dirname(SELF), 'install.mjs');
   const r = spawnSync(process.execPath, [installer, ...args], { stdio: 'inherit' });
   if (r.error) { console.error(`sasonica install: ${r.error.message}`); process.exit(1); }
+  process.exit(r.status ?? 1);
+}
+
+// `sasonica pair`: the umbrella's pairing entry (docs/umbrella.md). Pairing
+// lives in agent-media's canvas, which owns the codes and the tokens they
+// unlock, so this hands over to `media-visual-canvas pair`, arguments and all:
+// one name to remember, one implementation.
+if (sub === 'pair') {
+  const r = spawnSync('media-visual-canvas', ['pair', ...rest], { stdio: 'inherit' });
+  if (r.error?.code === 'ENOENT') {
+    console.error('sasonica pair: media-visual-canvas is not on PATH; '
+      + 'pairing needs agent-media on this machine');
+    process.exit(1);
+  }
+  if (r.error) { console.error(`sasonica pair: ${r.error.message}`); process.exit(1); }
   process.exit(r.status ?? 1);
 }
 

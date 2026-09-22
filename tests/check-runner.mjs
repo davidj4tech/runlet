@@ -8,7 +8,7 @@
 // sasonica.mjs reads its config once at module load, so each case runs in
 // its own process. Cases marked `loop:` start the polling loop rather than
 // --once, and assert while it runs; the rest use --once and assert after.
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -511,7 +511,7 @@ const cases = {
     const env = { ...process.env, SASONICA_CONF: empty, HOME: empty, USERPROFILE: empty };
     delete env.SASONICA_KEY;
     const out = execFileSync(process.execPath, [RUNNER, '--help'], { encoding: 'utf8', env });
-    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica url', 'sasonica install', 'SASONICA_WORKER_URL']) {
+    for (const expected of ['sasonica skills', 'sasonica status', 'sasonica url', 'sasonica install', 'sasonica pair', 'SASONICA_WORKER_URL']) {
       assert.match(out, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     }
     rmSync(empty, { recursive: true, force: true });
@@ -706,6 +706,25 @@ const cliCases = {
     assert.equal(refused.status, 2);
     assert.match(String(refused.stderr), /only the shell exists/);
     rmSync(tmp, { recursive: true, force: true });
+  },
+
+  // `sasonica pair` is agent-media's `media-visual-canvas pair` under the
+  // umbrella's name: it hands over with the arguments intact and the exit
+  // status kept, and says what is missing when agent-media is not installed.
+  pairHandsOver() {
+    if (process.platform === 'win32') return;   // the stand-in below is a shell script
+    const bin = mkdtempSync(path.join(tmpdir(), 'sasonica-pair-'));
+    const fake = path.join(bin, 'media-visual-canvas');
+    writeFileSync(fake, '#!/bin/sh\necho "args: $*"\nexit 3\n', { mode: 0o755 });
+    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    const r = spawnSync(process.execPath, [RUNNER, 'pair', '--device', 'Pixel 8a'], { env, encoding: 'utf8' });
+    assert.equal(r.stdout.trim(), 'args: pair --device Pixel 8a');
+    assert.equal(r.status, 3);
+    const none = spawnSync(process.execPath, [RUNNER, 'pair'],
+      { env: { ...process.env, PATH: bin + '-missing' }, encoding: 'utf8' });
+    assert.equal(none.status, 1);
+    assert.match(none.stderr, /media-visual-canvas is not on PATH/);
+    rmSync(bin, { recursive: true, force: true });
   },
 
   // `sasonica url [--name <n>]`: the shared URL from the env file, with the
