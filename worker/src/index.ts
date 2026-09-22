@@ -205,6 +205,9 @@ function cleanName(raw: unknown, max = 64): string {
 const FRIENDLY: Record<string, string> = {
   'claude-user': 'claude.ai',
   'claude-ai': 'claude.ai',
+  // clientInfo.name since late Sep 2026: "Anthropic/ClaudeAI" (the /version
+  // split leaves "anthropic").
+  'anthropic': 'claude.ai',
   'openai-mcp': 'chatgpt',
 }
 export function friendly(name: string): string | null {

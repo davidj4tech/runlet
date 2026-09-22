@@ -514,6 +514,7 @@ const cases = {
   async friendlyNames() {
     assert.equal(mod.friendly('Claude-User'), 'claude.ai');
     assert.equal(mod.friendly('openai-mcp/1.0.0'), 'chatgpt');
+    assert.equal(mod.agentFromInitialize({ clientInfo: { name: 'Anthropic/ClaudeAI', version: '1.0.0' } }), 'claude.ai');
     assert.equal(mod.friendly('python-httpx/0.28.1'), null);
     assert.equal(mod.agentFromInitialize({ clientInfo: { name: 'claude-ai', version: '0.1.0' } }), 'claude.ai');
     assert.equal(mod.agentFromInitialize({ clientInfo: { name: 'cursor', version: '2' } }), 'cursor@2');
