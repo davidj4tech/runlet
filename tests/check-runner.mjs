@@ -290,6 +290,24 @@ function writeTools(conf) {
   return shas;
 }
 
+/** One tool that sleeps for a minute but declares a two-second limit. */
+function writeSlowTool(conf) {
+  const dir = path.join(conf, 'tools');
+  mkdirSync(dir, { recursive: true });
+  const tool = {
+    name: 'slow',
+    description: 'Takes longer than it is allowed to.',
+    input: { type: 'object', properties: {} },
+    argv: [process.execPath, '-e', 'setTimeout(() => {}, 60000)'],
+    timeout_s: 2,
+  };
+  writeFileSync(path.join(dir, 'test.json'), JSON.stringify({ skill: 'test', tools: [tool] }));
+  return createHash('sha256').update(canonicalJson({
+    argv: tool.argv, description: tool.description, input: tool.input,
+    name: 'test__slow', timeout_s: 2,
+  }), 'utf8').digest('hex');
+}
+
 /** The runner's canonical JSON: keys sorted at every level. */
 function canonicalJson(value) {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
@@ -379,6 +397,17 @@ const cases = {
     const db = await start([job(toolCall('test__echo', { text: 'x'.repeat(50) }, sha), { kind: 'tool' })]);
     assert.equal(db.row(1).status, 'rejected');
     assert.match(db.row(1).output, /text is 50 characters; the limit is 40/);
+  },
+
+  // A tool may ask for a shorter limit than the machine's; the manifest says
+  // so, and the sha covers it.
+  async aToolsOwnTimeoutApplies() {
+    const { conf } = setup({ SASONICA_CMD_TIMEOUT: 60 });
+    const sha = writeSlowTool(conf);
+    const db = await start([job(toolCall('test__slow', {}, sha), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'timeout');
+    assert.equal(db.row(1).exit_code, 124);
+    assert.match(norm(db.row(1).output), /killed after 2s/);
   },
 
   async aBadSignatureIsStillRefusedOnAToolRow() {

@@ -725,8 +725,11 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
 // Returns { lane, done }. `lane` settles when the queue may move on — the job
 // exited, or it was detached. `done` settles when the result is on the row.
 // `run` is either a shell string (run_command) or `{ file, args }` — a typed
-// tool's argv, spawned directly with no shell in the picture.
-function executeAndWatch(id, run) {
+// tool's argv, spawned directly with no shell in the picture. A tool may ask
+// for a shorter limit than the machine's (`timeout_s` in its manifest);
+// nothing may ask for a longer one.
+function executeAndWatch(id, run, limitS = 0) {
+  const limit = limitS > 0 ? Math.min(limitS, T.CMD_TIMEOUT) : T.CMD_TIMEOUT;
   const outFile = path.join(STATE_DIR, `job.${id}.out`);
   // A raw fd, not createWriteStream: a fresh stream's .fd is still null when
   // spawn validates stdio, and spawn rejects it (ERR_INVALID_ARG_VALUE).
@@ -753,9 +756,9 @@ function executeAndWatch(id, run) {
 
   const timer = setTimeout(() => {
     timedOut = true;
-    log(`#${id}: over the ${T.CMD_TIMEOUT}s limit — stopping it`);
+    log(`#${id}: over the ${limit}s limit — stopping it`);
     killTreeGracefully(child.pid, 10_000, alive);
-  }, T.CMD_TIMEOUT * 1000);
+  }, limit * 1000);
 
   // Poll the row for cancel and background, and copy progress onto it, in
   // step with the bash watcher. Scheduled by the clock, not by loop count.
@@ -797,7 +800,7 @@ function executeAndWatch(id, run) {
       // 124, the code `timeout` gave the bash runner, so a timeout reads the
       // same to anything written against exit_code before the port.
       await writeResult(id, 'timeout', 124, `${out}\nsasonica: killed after `
-        + `${T.CMD_TIMEOUT}s`);
+        + `${limit}s`);
       log(`#${id}: timed out`);
     } else {
       await writeResult(id, 'done', code, out);
@@ -836,7 +839,7 @@ async function runOne({ id, command, sig, nonce, kind }) {
 
   // A typed tool call (§1): what runs is this machine's argv template with
   // the arguments filled in, not anything the row could name.
-  let run = command;
+  let run = command, limitS = 0;
   if (String(kind) === 'tool') {
     const plan = planToolRow(command);
     if (plan.error) {
@@ -845,6 +848,7 @@ async function runOne({ id, command, sig, nonce, kind }) {
       return settled;
     }
     run = { file: plan.argv[0], args: plan.argv.slice(1) };
+    limitS = plan.entry.timeout_s;
     log(`#${id}: running tool ${plan.entry.name}: ${plan.argv.join(' ').slice(0, 120)}`);
   } else {
     log(`#${id}: running: ${command.slice(0, 80)}`);
@@ -852,7 +856,7 @@ async function runOne({ id, command, sig, nonce, kind }) {
   // The row is claimed and the nonce is spent, so it can never be retried:
   // anything thrown from here has to land on the row, not in the poll loop.
   try {
-    return executeAndWatch(id, run);
+    return executeAndWatch(id, run, limitS);
   } catch (e) {
     log(`#${id}: failed to start: ${e.message}`);
     await writeResult(id, 'error', -1, `sasonica: ${e.message}`);

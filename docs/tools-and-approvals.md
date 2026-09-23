@@ -132,7 +132,12 @@ for §2 as well. `ask_session` is §4.
   `["media", "say", "{voice}", "{text}"]` with no voice is two elements.
   The sha256 is over everything that decides what runs (name, description,
   input, argv, timeout), so editing a manifest refuses calls queued against
-  the old one.
+  the old one. `timeout_s` is the tool's own limit, capped by the machine's
+  `SASONICA_CMD_TIMEOUT` — a tool may ask for less time, never for more.
+  Note that a tool which waits on something (`media say` waits for the words
+  to be spoken, behind whatever speech is already queued) holds the serial
+  lane while it does; that is `run_command`'s behaviour too, and §2's
+  approvals are where per-tool scheduling belongs.
 - Tests: `tests/check-worker.mjs` (publish, list, a call queued as a row,
   bad arguments refused before the queue, an unpublished tool, a name that
   would shadow a built-in) and `tests/check-runner.mjs` (the argv runs, an
