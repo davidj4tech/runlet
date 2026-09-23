@@ -9,7 +9,7 @@
 // are what replaces it, so they are the only thing standing between a
 // machine's own credential and everyone else's commands.
 import assert from 'node:assert/strict';
-import { fakeD1 } from './fake-d1.mjs';
+import { fakeD1, sign } from './fake-d1.mjs';
 
 const mod = await import('../worker/src/index.ts');
 const worker = mod.default;
@@ -34,6 +34,83 @@ const call = async (env, body) => {
 };
 
 const cases = {
+
+  // --- typed tools (docs/tools-and-approvals.md §1) --------------------------
+  //
+  // The runner publishes what its skills can do; the Worker lists them and
+  // queues a call as a row naming the tool. The argv never comes here, so
+  // the Worker cannot be made to widen what runs -- only to ask for a tool
+  // the owner declared, with arguments that pass its schema.
+
+  async toolsArePublishedAndListed() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    const tools = [{ name: 'speak__speak', description: 'Say something out loud.', sha256: 'a'.repeat(64),
+                     input: { type: 'object', properties: { text: { type: 'string', maxLength: 20 } }, required: ['text'] } }];
+    const r = await call(env, { op: 'tools', runner: 'red5', tools });
+    assert.equal(r.status, 200);
+    assert.equal(r.body.tools, 1);
+    assert.equal(f.tools().length, 1);
+    // No argv reached the database, whatever the runner sent.
+    assert.ok(!JSON.stringify(f.tools()[0]).includes('argv'));
+    const listed = await mcp(env, URL_SECRET, 'tools/list');
+    const names = JSON.parse(listed.text).result.tools.map((t) => t.name);
+    assert.deepEqual(names, ['run_command', 'cancel', 'detach', 'get_result', 'speak__speak']);
+    // Publishing again is the whole set, so a tool the owner deleted goes.
+    await call(env, { op: 'tools', runner: 'red5', tools: [] });
+    assert.equal(f.tools().length, 0);
+  },
+
+  async aToolCallQueuesARowNamingIt() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    await call(env, { op: 'tools', runner: 'red5', tools: [{
+      name: 'speak__speak', description: 'Say it.', sha256: 'b'.repeat(64),
+      input: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }] });
+    const r = await mcp(env, URL_SECRET, 'speak__speak', { text: 'hello there', wait: 0 });
+    assert.match(r.text, /^#1 pending/);
+    const row = f.row(1);
+    assert.equal(row.kind, 'tool');
+    // Canonical JSON: keys sorted, so the runner verifies the bytes that
+    // were signed.
+    assert.equal(row.command, JSON.stringify({ args: { text: 'hello there' }, manifest_sha: 'b'.repeat(64), tool: 'speak__speak' }));
+    // Signed exactly as a shell row is.
+    assert.equal(row.sig, sign('ab'.repeat(32), row.nonce, row.command));
+    assert.equal(row.agent, 'unknown');
+  },
+
+  async badArgumentsAreRefusedBeforeTheQueue() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    await call(env, { op: 'tools', runner: 'red5', tools: [{
+      name: 'music__play', description: 'Play something.', sha256: 'c'.repeat(64),
+      input: { type: 'object', properties: { query: { type: 'string', maxLength: 5 }, shuffle: { type: 'boolean' } },
+               required: ['query'] } }] });
+    for (const [args, want] of [
+      [{}, /missing required argument "query"/],
+      [{ query: 'a much longer one' }, /query is 17 characters; the limit is 5/],
+      [{ query: 'ok', shuffle: 'yes' }, /shuffle must be a boolean/],
+      [{ query: 'ok', loud: true }, /unknown argument "loud"/],
+    ]) {
+      const r = await mcp(env, URL_SECRET, 'music__play', args);
+      assert.match(r.text, want);
+    }
+    assert.equal(f.all().length, 0, 'nothing was queued');
+  },
+
+  async anUnpublishedToolIsNotATool() {
+    const f = fakeD1([]);
+    const env = envFor(f.binding);
+    const r = await mcp(env, URL_SECRET, 'speak__speak', { text: 'hi' });
+    assert.match(r.text, /unknown tool/);
+    assert.equal(f.all().length, 0);
+    // And a name that could shadow a built-in is refused at publish time.
+    const bad = await call(env, { op: 'tools', runner: 'red5', tools: [{ name: 'run_command', sha256: 'd'.repeat(64) }] });
+    assert.equal(bad.status, 400);
+    const shape = await call(env, { op: 'tools', runner: 'red5', tools: [{ name: 'ok__ok', sha256: 'not hex' }] });
+    assert.equal(shape.status, 400);
+  },
+
   // A wrong token and an absent one must look exactly like an unknown path:
   // whether the API exists cannot depend on getting the credential right.
   async authIsAll404() {

@@ -63,6 +63,39 @@ ln -s ~/projects/agent-mail/skills/agent-mail/SKILL.md ~/.config/sasonica/skills
 
 Each entry is a Markdown file, a symlink to one, or a directory containing a `SKILL.md`. Its frontmatter should give a `name:` and a `description:`. The `run_command` description tells the assistant to start with `sasonica skills`. The installer puts a `sasonica` command in `~/.local/bin`, and `sasonica --help` points there too. That command prints each skill's name, its description and the path to read before using it. Where `~/.local/bin` is not on the login-shell `PATH`, `"$SASONICA" skills` works instead: the runner sets `$SASONICA` for every command it runs. Nothing is found by scanning the disk: a tool is listed only when you put it in this directory.
 
+## Typed tools
+
+A skill can also declare **actions with typed arguments**, in
+`~/.config/sasonica/tools/<skill>.json`. Each one names a fixed argv, and a
+call fills the arguments into it and runs it **directly — never through a
+shell**:
+
+```json
+{"skill": "media",
+ "tools": [{"name": "speak",
+            "description": "Say something out loud through agent-media's voice.",
+            "input": {"type": "object", "required": ["text"],
+                      "properties": {"text": {"type": "string", "maxLength": 2000}}},
+            "argv": ["media", "say", "--", "{text}"],
+            "timeout_s": 60}]}
+```
+
+`tools.example/agent-media.json` is a working set (speak, music now / pause /
+resume, memory search); copy it there to try it. The runner publishes them to
+the Worker at startup and whenever a manifest changes, and the assistant sees
+them as ordinary MCP tools named `<skill>__<tool>` — `media__speak`.
+`sasonica tools` prints what this machine publishes, argv and all.
+
+**Why bother, when `run_command` can do anything?** Because the argv never
+leaves the machine. The Worker is told the name, the description and the
+schema; it can queue a call to a tool you declared, with arguments that pass
+your schema, and nothing else. An argument is one argv element whatever is in
+it — `; rm -rf ~` is a string that happens to contain semicolons. So a typed
+call is safe in a way a free-text command is not, which is what the approvals
+in `docs/tools-and-approvals.md` will build on. Only calls that are *one
+command* belong here: playing music by name is a search and then a play, so
+it stays with `run_command`.
+
 ## How it works
 
 1. The MCP client calls the Worker through a secret URL.
@@ -287,7 +320,7 @@ Those omissions are part of the design. If you need richer client identity, sess
 
 | File | Purpose |
 |---|---|
-| `worker/src/index.ts` | Remote MCP Worker: four tools, signing, queueing, and result retrieval. |
+| `worker/src/index.ts` | Remote MCP Worker: four built-in tools plus whatever the runners publish, signing, queueing, and result retrieval. |
 | `schema.sql` | D1 schema: the command table and its pending-row index, and the per-client URL table. |
 | `sasonica.mjs` | The runner on every platform: poll, verify, execute, monitor, and report. |
 | `install.mjs` | The installer on every platform: provisioning, config, and the service. |

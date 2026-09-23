@@ -27,7 +27,7 @@
 // Every tunable is re-read from the env file each poll, so editing it is live
 // within one interval and needs no restart.
 
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { readFileSync, existsSync, appendFileSync, writeFileSync, mkdirSync, readdirSync,
          realpathSync, statSync, openSync, readSync, closeSync, unlinkSync } from 'node:fs';
@@ -146,12 +146,232 @@ function ctEqual(a, b) {
 }
 
 // --- subcommands that need no database --------------------------------------
+// --- typed tools (docs/tools-and-approvals.md §1) -----------------------------
+//
+// A skill declares actions with typed arguments in
+// `$CONF/tools/<skill>.json`; this publishes them to the Worker, which lists
+// them as ordinary MCP tools. A call arrives as a row whose command is
+// canonical JSON — the tool's name, its arguments and the sha256 of the
+// manifest entry it was made against — and runs a FIXED argv with the
+// arguments filled in, through execFile, never a shell.
+//
+// So the worst a leaked connector URL can do with a tool row is call a tool
+// the owner declared, with arguments that pass the schema. It cannot change
+// the argv: that template exists only here.
+const TOOLS_DIR = path.join(CONF, 'tools');
+const TOOL_NAME_RE = /^[a-z0-9][a-z0-9_]{0,40}__[a-z0-9][a-z0-9_]{0,40}$/;
+const BUILT_IN_TOOLS = ['run_command', 'cancel', 'detach', 'get_result'];
+//: `{ name: {name, description, input, argv, timeout_s, sha256, skill} }`.
+let TOOLS = new Map();
+let TOOLS_STAMP = '';        // mtimes of the manifests, to notice an edit
+
+/** Canonical JSON: keys sorted at every level, so two sides hash the same text. */
+function canonical(value) {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+const sha256Hex = (text) => createHash('sha256').update(text, 'utf8').digest('hex');
+
+/** The manifests on disk, as a map. A bad file is logged and skipped, never fatal. */
+function readToolManifests() {
+  const found = new Map();
+  let files = [];
+  try { files = readdirSync(TOOLS_DIR).filter((f) => f.endsWith('.json')).sort(); } catch { return found; }
+  for (const file of files) {
+    let doc;
+    try { doc = JSON.parse(readFileSync(path.join(TOOLS_DIR, file), 'utf8')); } catch (e) {
+      log(`tools: ${file} is not valid JSON (${e.message}) — skipped`);
+      continue;
+    }
+    const skill = String(doc?.skill || path.basename(file, '.json'));
+    for (const t of Array.isArray(doc?.tools) ? doc.tools : []) {
+      const name = `${skill}__${String(t?.name ?? '')}`.toLowerCase();
+      if (!TOOL_NAME_RE.test(name) || BUILT_IN_TOOLS.includes(name)) {
+        log(`tools: ${file}: bad tool name ${JSON.stringify(name)} — skipped`);
+        continue;
+      }
+      if (!Array.isArray(t?.argv) || !t.argv.length || t.argv.some((a) => typeof a !== 'string')) {
+        log(`tools: ${name}: argv must be a non-empty array of strings — skipped`);
+        continue;
+      }
+      const entry = {
+        name,
+        skill,
+        description: String(t.description ?? ''),
+        input: (t.input && typeof t.input === 'object') ? t.input : { type: 'object' },
+        argv: t.argv,
+        timeout_s: Number(t.timeout_s) > 0 ? Number(t.timeout_s) : 0,
+      };
+      // Over everything that decides what runs: a manifest edited after a
+      // call was queued gives a different sha, and the call is refused.
+      entry.sha256 = sha256Hex(canonical({
+        argv: entry.argv, description: entry.description, input: entry.input,
+        name: entry.name, timeout_s: entry.timeout_s,
+      }));
+      found.set(name, entry);
+    }
+  }
+  return found;
+}
+
+/** A cheap stamp of the manifests, for noticing an edit without re-reading them. */
+function toolsStamp() {
+  try {
+    return readdirSync(TOOLS_DIR).filter((f) => f.endsWith('.json')).sort()
+      .map((f) => {
+        const st = statSync(path.join(TOOLS_DIR, f));
+        return `${f}:${st.size}:${st.mtimeMs}`;
+      }).join('|');
+  } catch { return ''; }
+}
+
+/**
+ * Load the manifests and tell the Worker about them, if anything changed.
+ * `force` publishes even when nothing did (at startup, and after a failure).
+ */
+async function publishTools(force = false) {
+  const stamp = toolsStamp();
+  if (!force && stamp === TOOLS_STAMP) return false;
+  TOOLS = readToolManifests();
+  TOOLS_STAMP = stamp;
+  const tools = [...TOOLS.values()].map(({ name, description, input, sha256 }) =>
+    ({ name, description, input, sha256 }));
+  try {
+    await api('tools', { tools });
+    log(`tools: published ${tools.length}${tools.length ? `: ${tools.map((t) => t.name).join(', ')}` : ''}`);
+    return true;
+  } catch (e) {
+    // Try again next tick: an unpublished tool is simply not listed.
+    TOOLS_STAMP = '';
+    log(`tools: publishing failed (${e.message})`);
+    return false;
+  }
+}
+
+/** `""` when `args` fit `schema`, else what is wrong. The Worker checks first; this is the check that counts. */
+function checkArgs(schema, args) {
+  if (!schema || typeof schema !== 'object') return '';
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return 'arguments must be an object';
+  const props = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {};
+  for (const want of Array.isArray(schema.required) ? schema.required : []) {
+    if (args[String(want)] === undefined) return `missing required argument ${JSON.stringify(want)}`;
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const spec = props[key];
+    if (!spec) {
+      if (schema.additionalProperties === false || Object.keys(props).length) {
+        return `unknown argument ${JSON.stringify(key)}`;
+      }
+      continue;
+    }
+    const bad = checkValue(spec, value, key);
+    if (bad) return bad;
+  }
+  return '';
+}
+
+function checkValue(spec, value, key) {
+  const type = String(spec.type ?? '');
+  if (type === 'string' || type === 'number' || type === 'boolean') {
+    if (typeof value !== type) return `${key} must be a ${type}`;
+  } else if (type === 'integer') {
+    if (typeof value !== 'number' || !Number.isInteger(value)) return `${key} must be an integer`;
+  } else if (type === 'array') {
+    if (!Array.isArray(value)) return `${key} must be an array`;
+    if (spec.maxItems !== undefined && value.length > Number(spec.maxItems)) {
+      return `${key} has ${value.length} items; the limit is ${spec.maxItems}`;
+    }
+    for (const item of value) {
+      const bad = checkValue(spec.items ?? {}, item, `each item of ${key}`);
+      if (bad) return bad;
+    }
+    return '';
+  }
+  if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
+    return `${key} must be one of ${spec.enum.map((e) => JSON.stringify(e)).join(', ')}`;
+  }
+  if (typeof value === 'string') {
+    if (spec.maxLength !== undefined && value.length > Number(spec.maxLength)) {
+      return `${key} is ${value.length} characters; the limit is ${spec.maxLength}`;
+    }
+    if (spec.minLength !== undefined && value.length < Number(spec.minLength)) {
+      return `${key} is shorter than ${spec.minLength} characters`;
+    }
+    if (typeof spec.pattern === 'string') {
+      let re;
+      try { re = new RegExp(spec.pattern); } catch { return ''; }
+      if (!re.test(value)) return `${key} does not match ${spec.pattern}`;
+    }
+  }
+  if (typeof value === 'number') {
+    if (spec.minimum !== undefined && value < Number(spec.minimum)) return `${key} is below ${spec.minimum}`;
+    if (spec.maximum !== undefined && value > Number(spec.maximum)) return `${key} is above ${spec.maximum}`;
+  }
+  return '';
+}
+
+/**
+ * The argv to run, with the arguments filled in — or `{ error }`.
+ *
+ * Every `{name}` in a template element is replaced by that argument's value,
+ * as ONE element. A value is never split, never re-parsed and never reaches
+ * a shell, so `; rm -rf ~` is an argument that happens to contain
+ * semicolons. An element that is exactly `{name}` for an argument that was
+ * not given drops out, which is how an optional argument works; a missing
+ * one inside a longer element is an empty string.
+ */
+function buildArgv(entry, args) {
+  const out = [];
+  for (const part of entry.argv) {
+    const whole = /^\{([a-zA-Z0-9_]+)\}$/.exec(part);
+    if (whole) {
+      const value = args[whole[1]];
+      if (value === undefined || value === null) continue;      // optional, not given
+      if (Array.isArray(value)) { out.push(...value.map((v) => String(v))); continue; }
+      out.push(String(value));
+      continue;
+    }
+    out.push(part.replace(/\{([a-zA-Z0-9_]+)\}/g, (_, k) => {
+      const value = args[k];
+      return value === undefined || value === null ? '' : String(value);
+    }));
+  }
+  if (!out.length) return { error: 'the argv template filled in to nothing' };
+  return { argv: out };
+}
+
+/** What a tool row asks for, checked against this machine's own manifest. */
+function planToolRow(command) {
+  let asked;
+  try { asked = JSON.parse(command); } catch { return { error: 'not a tool call' }; }
+  const name = String(asked?.tool ?? '');
+  const entry = TOOLS.get(name);
+  if (!entry) return { error: `no tool named ${JSON.stringify(name)} on this machine` };
+  // The manifest may have been edited since the call was queued. Running the
+  // new argv for an old call is exactly what the sha is here to prevent.
+  if (String(asked?.manifest_sha ?? '') !== entry.sha256) {
+    return { error: `${name}: the manifest changed since this call was made` };
+  }
+  const args = (asked?.args && typeof asked.args === 'object' && !Array.isArray(asked.args)) ? asked.args : {};
+  const bad = checkArgs(entry.input, args);
+  if (bad) return { error: `${name}: ${bad}` };
+  const built = buildArgv(entry, args);
+  if (built.error) return { error: `${name}: ${built.error}` };
+  return { entry, argv: built.argv };
+}
+
+
 const [sub, ...rest] = process.argv.slice(2);
 
 if (sub === '--help' || sub === '-h' || sub === 'help') {
   console.log(`sasonica: Sasonica Shell runs signed shell commands queued by an assistant, on this machine.
 
   sasonica skills        the tools the owner has set up here, and where to read about each
+  sasonica tools         the typed tools this machine publishes, and the argv each runs
   sasonica status [n]    the last n rows (default 10), newest first, with who queued each
   sasonica client add <label> | list | revoke <label>
                          one connector URL per assistant, each revocable on its own
@@ -271,6 +491,30 @@ if (sub === 'skills') {
     const desc = field('description')
       || lines.find((l) => l.trim() && !/^(---|#)/.test(l)) || '';
     console.log(`\n${name}: ${desc}\n  ${f}`);
+  }
+  process.exit(0);
+}
+
+if (sub === 'tools') {
+  // What an assistant is offered beyond run_command: the typed tools this
+  // machine publishes (§1 of docs/tools-and-approvals.md). Reads the same
+  // manifests the runner does, and prints the argv, which is the part that
+  // never leaves here.
+  const found = readToolManifests();
+  if (!found.size) {
+    console.log(`No typed tools on ${RUNNER_ID}. The owner can add one with a manifest in:`);
+    console.log(`  ${TOOLS_DIR}/<skill>.json`);
+    console.log('  (tools.example/agent-media.json beside sasonica.mjs is a working one)');
+    process.exit(0);
+  }
+  console.log(`Typed tools on ${RUNNER_ID}. Each runs its argv with no shell in the way.`);
+  for (const t of found.values()) {
+    console.log(`\n${t.name}: ${t.description}`);
+    console.log(`  argv: ${JSON.stringify(t.argv)}`);
+    const props = Object.keys(t.input?.properties ?? {});
+    const req = new Set(t.input?.required ?? []);
+    console.log(`  args: ${props.length ? props.map((k) => (req.has(k) ? k : `[${k}]`)).join(', ') : 'none'}`);
+    console.log(`  sha256: ${t.sha256}`);
   }
   process.exit(0);
 }
@@ -480,7 +724,9 @@ for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP']) {
 
 // Returns { lane, done }. `lane` settles when the queue may move on — the job
 // exited, or it was detached. `done` settles when the result is on the row.
-function executeAndWatch(id, command) {
+// `run` is either a shell string (run_command) or `{ file, args }` — a typed
+// tool's argv, spawned directly with no shell in the picture.
+function executeAndWatch(id, run) {
   const outFile = path.join(STATE_DIR, `job.${id}.out`);
   // A raw fd, not createWriteStream: a fresh stream's .fd is still null when
   // spawn validates stdio, and spawn rejects it (ERR_INVALID_ARG_VALUE).
@@ -488,7 +734,10 @@ function executeAndWatch(id, command) {
   const fd = openSync(outFile, 'w');
   let child;
   try {
-    child = spawn(SHELL, shellArgs(command), {
+    const [file, args] = typeof run === 'string'
+      ? [SHELL, shellArgs(run)]
+      : [run.file, run.args];
+    child = spawn(file, args, {
       detached: !WIN, windowsHide: true, stdio: ['ignore', fd, fd],
       env: { ...process.env, SASONICA: sasonicaShim() },
     });
@@ -571,7 +820,7 @@ const seen = (nonce) =>
 // what the Worker cannot -- that the row carries a signature made with the
 // key only this machine and the Worker share, and a nonce new to this
 // machine.
-async function runOne({ id, command, sig, nonce }) {
+async function runOne({ id, command, sig, nonce, kind }) {
   const settled = { lane: Promise.resolve(), done: Promise.resolve() };
   if (seen(nonce)) {
     log(`#${id}: nonce already used — rejecting as a replay`);
@@ -585,11 +834,25 @@ async function runOne({ id, command, sig, nonce }) {
   }
   appendFileSync(SEEN, `${nonce}\n`);     // append-only: safe under parallelism
 
-  log(`#${id}: running: ${command.slice(0, 80)}`);
+  // A typed tool call (§1): what runs is this machine's argv template with
+  // the arguments filled in, not anything the row could name.
+  let run = command;
+  if (String(kind) === 'tool') {
+    const plan = planToolRow(command);
+    if (plan.error) {
+      log(`#${id}: refused: ${plan.error}`);
+      await writeResult(id, 'rejected', -1, `sasonica: ${plan.error}`);
+      return settled;
+    }
+    run = { file: plan.argv[0], args: plan.argv.slice(1) };
+    log(`#${id}: running tool ${plan.entry.name}: ${plan.argv.join(' ').slice(0, 120)}`);
+  } else {
+    log(`#${id}: running: ${command.slice(0, 80)}`);
+  }
   // The row is claimed and the nonce is spent, so it can never be retried:
   // anything thrown from here has to land on the row, not in the poll loop.
   try {
-    return executeAndWatch(id, command);
+    return executeAndWatch(id, run);
   } catch (e) {
     log(`#${id}: failed to start: ${e.message}`);
     await writeResult(id, 'error', -1, `sasonica: ${e.message}`);
@@ -654,6 +917,7 @@ function trimNonces() {
 
 async function poll() {
   reloadTunables();
+  await publishTools();          // a no-op unless a manifest changed
   if (overLoadCeiling()) return 0;
   // A claimed row is already 'running', so ask only for what can start this
   // moment; anything else would be marked running with nothing running it.
@@ -703,6 +967,7 @@ if (sub === '--once') {
     + ` with a ${T.CMD_TIMEOUT}s limit per command`
     + (T.PARALLEL > 1 ? `, up to ${T.PARALLEL} at once` : ''));
   await sweepOrphans();
+  await publishTools(true);
   let lastPrune = 0, lastStale = Date.now();
   for (;;) {
     try {

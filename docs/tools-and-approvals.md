@@ -1,6 +1,7 @@
 # Typed tools, phone approvals, and assistants as threads (proposal, 21 Sep 2026)
 
-Status: **proposal; §3's client labels are built** (21 Sep 2026), the rest is not. How Sasonica Shell and the assistants that use it
+Status: **§1 typed tools and §3's client labels are built** (23 Sep 2026); the
+rest is proposal. How Sasonica Shell and the assistants that use it
 (Claude.ai, ChatGPT custom connectors, any remote MCP host) fit into the
 Sasonica umbrella (`umbrella.md`) beyond "a shell with a skills list".
 
@@ -24,7 +25,13 @@ soon; they reinforce each other.
   command allowlist"). Everything below keeps that true for `run_command`
   and adds a narrower door beside it.
 
-## 1. Typed tools
+## 1. Typed tools — BUILT 23 Sep 2026
+
+Built as proposed, with three differences, each noted where it belongs
+below: the manifest goes to the Worker **without its argv**; the runner
+publishes through the existing `/runner` API (`op: "tools"`) rather than a
+path of its own; and there is no `tools/list_changed` notification, because
+this transport has no way to push one.
 
 **Idea:** a skill can declare actions with typed arguments. The runner
 publishes them; the Worker lists them as ordinary MCP tools; a call runs a
@@ -67,12 +74,18 @@ prose. `~/.config/sasonica/tools/<skill>.json`:
 ### How it flows
 
 1. **Publish.** On start, and whenever the manifests change, the runner
-   sends `POST /runner/tools` with the manifests and their sha256. The
-   Worker stores them in a new table `tools(runner, name, manifest,
-   sha256, updated_at)`.
+   sends `{"op": "tools", "runner": "<host>", "tools": [...]}` to `/runner`
+   (the API it already uses, behind the same bearer token). **AS BUILT:**
+   each entry is the name, the description, the input schema and the
+   sha256 — **not the argv**. The Worker cannot leak, and cannot be
+   tricked into changing, a command it was never told. The table is
+   `tools(runner, name, description, input, sha256, updated_at)`, and a
+   publish replaces that runner's whole set, so a deleted tool stops being
+   listed.
 2. **List.** `tools/list` answers the four built-ins plus every published
-   tool. MCP clients re-list on `notifications/tools/list_changed`; the
-   Worker sends it when the set changes.
+   tool. **AS BUILT:** there is no `notifications/tools/list_changed` — the
+   Worker answers requests and holds no connection to push one down. A
+   client that caches the list sees a new tool when it next lists.
 3. **Call.** `tools/call speak__speak {"text": "…"}` queues a row with
    `kind = 'tool'` and `command = {"tool": "speak__speak", "args": {…},
    "manifest_sha": "…"}` (canonical JSON), signed exactly as today — the
@@ -89,23 +102,44 @@ a tool row is safe to run without asking; a free-text row may not be (§2).
 
 ### The first manifests
 
-For agent-media: `speak(text)`, `music_play(query)`, `music_pause()`,
-`music_now()`, `memory_search(query)`, `sessions_list()`, `mail_send(to,
-subject, body)`, `mail_inbox()`. Each is a thin argv over a command that
-exists today. `ask_session` is §4.
+`tools.example/agent-media.json` in this repo, copied to
+`~/.config/sasonica/tools/`: `speak(text)`, `music_now()`, `music_pause()`,
+`music_resume()`, `memory_search(query)`. Each is a thin argv over a command
+that exists today.
+
+`music_play(query)` is **not** among them, and the reason is the shape of
+the idea: playing something by name is a search and then a play, which no
+fixed argv can be. Tools here are the calls that are one command; anything
+that needs a decision in the middle stays with `run_command`. `mail_send`
+and `mail_inbox` want an `--agent` identity chosen per caller, so they wait
+for §2 as well. `ask_session` is §4.
+
+`sasonica tools` prints what this machine publishes, argv and all.
 
 ### Worker and runner changes
 
 - Worker: the `tools` table, `POST /runner/tools`, merging tools into
   `tools/list`, `kind` on the row (`ALTER TABLE commands ADD COLUMN kind
   TEXT NOT NULL DEFAULT 'shell'`), schema validation, `list_changed`.
-- Runner: load the manifests, publish them, and for `kind = 'tool'` run
-  `execFile(argv)` instead of `bash -lc`. No new dependencies — the schema
-  subset needed (type, required, maxLength, enum, pattern) is small enough
-  to check by hand.
-- Tests: signing vectors for a tool row; a runner test that a template
-  cannot be widened by its arguments (`"; rm -rf ~"` arrives as one
-  harmless argv element); a Worker test that an unpublished tool is refused.
+- Runner: load the manifests, publish them, and for `kind = 'tool'` spawn
+  the argv directly instead of `bash -lc`. No new dependencies — the schema
+  subset (type, required, enum, pattern, min/max, maxLength, and an array
+  of strings) is small enough to check by hand, and it is checked in both
+  places.
+- **As built:** `wait` keeps its built-in meaning on a typed call (how long
+  to block for the result) unless the tool declares an argument of that
+  name. An optional argument that is not given drops its argv element, so
+  `["media", "say", "{voice}", "{text}"]` with no voice is two elements.
+  The sha256 is over everything that decides what runs (name, description,
+  input, argv, timeout), so editing a manifest refuses calls queued against
+  the old one.
+- Tests: `tests/check-worker.mjs` (publish, list, a call queued as a row,
+  bad arguments refused before the queue, an unpublished tool, a name that
+  would shadow a built-in) and `tests/check-runner.mjs` (the argv runs, an
+  argument cannot widen it — `; touch marker; rm -rf ~` arrives as one
+  element and no marker appears — an optional argument drops out, a changed
+  manifest refuses an old call, the runner checks the arguments itself, and
+  a bad signature is still refused).
 
 ## 2. Approvals on the phone
 
@@ -314,7 +348,7 @@ an install with no app.
 
 1. §3's client labels — tiny, and every later step wants to know who asked.
    **Done**, with the self-reported agent name alongside.
-2. §1 typed tools, with the agent-media manifests.
+2. §1 typed tools, with the agent-media manifests. **Done** (23 Sep 2026).
 3. §2 policy and approvals — needs the app's approval UI (the rebuild, in
    progress) and a local approval endpoint in agent-media.
 4. §4 `ask_session`, gated by §2.

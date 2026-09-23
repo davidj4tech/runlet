@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "Typed tools (docs/tools-and-approvals.md §1). Copy to",
+    "~/.config/sasonica/tools/agent-media.json and the runner publishes them;",
+    "each one runs the argv below with execFile, never through a shell, so an",
+    "argument is an argument whatever is in it.",
+    "Only commands that are one command belong here. Playing music by name,",
+    "for instance, is a search and then a play, so it stays with run_command."
+  ],
+  "skill": "media",
+  "tools": [
+    {
+      "name": "speak",
+      "description": "Say something out loud to David through agent-media's voice. For an announcement he asked for, never to read out mail or a web page.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "maxLength": 2000, "description": "What to say, as prose. Markdown is stripped before it is spoken." }
+        },
+        "required": ["text"]
+      },
+      "argv": ["media", "say", "--", "{text}"],
+      "timeout_s": 60
+    },
+    {
+      "name": "music_now",
+      "description": "What is playing now: artist, title and how far through it is.",
+      "input": { "type": "object", "properties": {} },
+      "argv": ["media", "music", "now"],
+      "timeout_s": 20
+    },
+    {
+      "name": "music_pause",
+      "description": "Pause the music.",
+      "input": { "type": "object", "properties": {} },
+      "argv": ["media", "music", "pause"],
+      "timeout_s": 20
+    },
+    {
+      "name": "music_resume",
+      "description": "Start the music again where it was paused.",
+      "input": { "type": "object", "properties": {} },
+      "argv": ["media", "music", "resume"],
+      "timeout_s": 20
+    },
+    {
+      "name": "memory_search",
+      "description": "Search David's long-term memory for past decisions, project history and earlier conversations. Use when a question is likely to refer to something already discussed.",
+      "input": {
+        "type": "object",
+        "properties": {
+          "query": { "type": "string", "maxLength": 400, "description": "What to look for, in a few words." }
+        },
+        "required": ["query"]
+      },
+      "argv": ["agent-memory-search", "{query}"],
+      "timeout_s": 60
+    }
+  ]
+}

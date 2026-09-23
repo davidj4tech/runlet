@@ -222,7 +222,10 @@ const cols = wrangler(['d1', 'execute', dbName, '--remote', '--json', '--command
 // file. The Worker writes every one of these on each run_command, so they
 // must exist before it is deployed -- which is why this comes first.
 for (const spec of ['background INTEGER NOT NULL DEFAULT 0', 'cancel INTEGER NOT NULL DEFAULT 0', 'runner TEXT',
-                    'client TEXT', 'agent TEXT', 'name TEXT']) {
+                    'client TEXT', 'agent TEXT', 'name TEXT',
+                    // A typed tool call rather than a shell string (§1 of
+                    // docs/tools-and-approvals.md).
+                    "kind TEXT NOT NULL DEFAULT 'shell'"]) {
   const col = spec.split(' ')[0];
   if (!new RegExp(`"name"\\s*:\\s*"${col}"`).test(cols)) {
     if (wrangler(['d1', 'execute', dbName, '--remote', '--command', `ALTER TABLE commands ADD COLUMN ${spec};`],

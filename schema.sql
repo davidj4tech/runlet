@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS commands (
   client     TEXT,                       -- which connector URL queued it (clients.label, or 'default')
   name       TEXT,                       -- the name that URL carried (/<secret>/<name>/mcp or ?as=), if any
   agent      TEXT,                       -- what the assistant says it is (clientInfo.name, or ua:<User-Agent>)
+  kind       TEXT    NOT NULL DEFAULT 'shell', -- shell (a bash string) | tool (a typed call)
   nonce      TEXT    NOT NULL UNIQUE,
   created_at TEXT    NOT NULL,
   updated_at TEXT    NOT NULL
@@ -42,3 +43,26 @@ CREATE TABLE IF NOT EXISTS clients (
   created_at    TEXT NOT NULL,
   revoked_at    TEXT                       -- NULL while the URL works
 );
+
+-- Typed tools (docs/tools-and-approvals.md §1): what each runner publishes.
+-- The argv template is NOT here and never leaves the runner -- that is the
+-- security property. This table holds only what the Worker needs to list a
+-- tool and check a call's arguments before queueing it: the name, the
+-- description, the JSON Schema, and the sha256 of the runner's own manifest
+-- entry, which is copied onto the row so the runner can refuse a call made
+-- against a manifest it has since changed.
+CREATE TABLE IF NOT EXISTS tools (
+  runner      TEXT NOT NULL,
+  name        TEXT NOT NULL,            -- on the wire: <skill>__<tool>
+  description TEXT NOT NULL,
+  input       TEXT NOT NULL,            -- JSON Schema, as JSON text
+  sha256      TEXT NOT NULL,            -- of the runner's manifest entry
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (runner, name)
+);
+
+-- Added later: which kind of row this is -- 'shell' (run_command, a bash
+-- string) or 'tool' (a typed call: command is canonical JSON naming the
+-- tool, its arguments and the manifest it was made against). ALTER TABLE is
+-- not idempotent in SQLite, so install.sh adds it to an older database:
+-- ALTER TABLE commands ADD COLUMN kind TEXT NOT NULL DEFAULT 'shell';

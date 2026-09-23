@@ -404,6 +404,128 @@ const TOOLS = [
   },
 ]
 
+// --- typed tools (docs/tools-and-approvals.md §1) ----------------------------
+//
+// A runner publishes what its skills can do: a name, a description and a
+// JSON Schema for the arguments. The argv template that actually runs stays
+// on the runner and is never sent here — so a leaked URL can call a tool the
+// owner declared, with arguments that pass its schema, and can neither widen
+// the command nor invent a tool. The row carries the manifest's sha256, and
+// the runner refuses a call made against a manifest it no longer has.
+//
+// The schema subset is small on purpose (type, required, enum, pattern,
+// min/max, maxLength, items for a string array): enough for a thin argv over
+// a command that exists, small enough to check by hand in both places.
+
+interface ToolRow {
+  runner: string
+  name: string
+  description: string
+  input: string
+  sha256: string
+}
+
+/** `<skill>__<tool>`, lower case, so a published tool cannot shadow a built-in. */
+const TOOL_NAME = /^[a-z0-9][a-z0-9_]{0,40}__[a-z0-9][a-z0-9_]{0,40}$/
+const BUILT_IN = ['run_command', 'cancel', 'detach', 'get_result']
+
+/** Every published tool, newest publish winning when two runners share a name. */
+async function publishedTools(env: Env): Promise<ToolRow[]> {
+  const { results = [] } = await env.DB.prepare(
+    `SELECT runner, name, description, input, sha256 FROM tools
+      GROUP BY name HAVING MAX(updated_at) ORDER BY name`,
+  ).all<ToolRow>()
+  return results
+}
+
+function parseSchema(text: string): any {
+  try {
+    const got = JSON.parse(text)
+    return got && typeof got === 'object' ? got : { type: 'object' }
+  } catch {
+    return { type: 'object' }
+  }
+}
+
+/**
+ * `""` when `args` fit `schema`, else what is wrong with them, in the words
+ * the caller sees. The runner checks the same things against its own copy;
+ * this one is for a quick, useful error rather than a queued row that fails.
+ */
+export function checkArgs(schema: any, args: any): string {
+  if (!schema || typeof schema !== 'object') return ''
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return 'arguments must be an object'
+  const props = (schema.properties && typeof schema.properties === 'object') ? schema.properties : {}
+  for (const want of Array.isArray(schema.required) ? schema.required : []) {
+    if (args[String(want)] === undefined) return `missing required argument ${JSON.stringify(want)}`
+  }
+  for (const [key, value] of Object.entries(args)) {
+    const spec = props[key]
+    if (!spec) {
+      if (schema.additionalProperties === false || Object.keys(props).length) {
+        return `unknown argument ${JSON.stringify(key)}`
+      }
+      continue
+    }
+    const bad = checkValue(spec, value, key)
+    if (bad) return bad
+  }
+  return ''
+}
+
+function checkValue(spec: any, value: any, key: string): string {
+  const type = String(spec.type ?? '')
+  if (type === 'string' || type === 'number' || type === 'integer' || type === 'boolean') {
+    const ok = type === 'integer'
+      ? typeof value === 'number' && Number.isInteger(value)
+      : typeof value === type
+    if (!ok) return `${key} must be ${type === 'integer' ? 'an integer' : `a ${type}`}`
+  } else if (type === 'array') {
+    if (!Array.isArray(value)) return `${key} must be an array`
+    if (spec.maxItems !== undefined && value.length > Number(spec.maxItems)) {
+      return `${key} has ${value.length} items; the limit is ${spec.maxItems}`
+    }
+    for (const item of value) {
+      const bad = checkValue(spec.items ?? {}, item, `each item of ${key}`)
+      if (bad) return bad
+    }
+    return ''
+  }
+  if (Array.isArray(spec.enum) && !spec.enum.includes(value)) {
+    return `${key} must be one of ${spec.enum.map((e: unknown) => JSON.stringify(e)).join(', ')}`
+  }
+  if (typeof value === 'string') {
+    if (spec.maxLength !== undefined && value.length > Number(spec.maxLength)) {
+      return `${key} is ${value.length} characters; the limit is ${spec.maxLength}`
+    }
+    if (spec.minLength !== undefined && value.length < Number(spec.minLength)) {
+      return `${key} is shorter than ${spec.minLength} characters`
+    }
+    if (typeof spec.pattern === 'string') {
+      let re: RegExp
+      try { re = new RegExp(spec.pattern) } catch { return '' }
+      if (!re.test(value)) return `${key} does not match ${spec.pattern}`
+    }
+  }
+  if (typeof value === 'number') {
+    if (spec.minimum !== undefined && value < Number(spec.minimum)) return `${key} is below ${spec.minimum}`
+    if (spec.maximum !== undefined && value > Number(spec.maximum)) return `${key} is above ${spec.maximum}`
+  }
+  return ''
+}
+
+/**
+ * What a tool row's `command` is: canonical JSON, keys in a fixed order, so
+ * the string signed here is the string the runner verifies — byte for byte,
+ * whatever either side's JSON library would otherwise do with key order or
+ * spacing. The signing scheme itself is unchanged (nonce "\n" command).
+ */
+export function toolCommand(tool: string, args: Record<string, unknown>, manifestSha: string): string {
+  const ordered: Record<string, unknown> = {}
+  for (const key of Object.keys(args).sort()) ordered[key] = args[key]
+  return JSON.stringify({ args: ordered, manifest_sha: manifestSha, tool })
+}
+
 interface Row {
   id: number
   status: string
@@ -497,7 +619,8 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
            SELECT id FROM (SELECT id FROM commands WHERE status = 'pending' AND background = 1
                            ORDER BY id LIMIT ?)
          )
-         RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background`,
+         RETURNING id, command, sig, nonce, COALESCE(background, 0) AS background,
+                   COALESCE(kind, 'shell') AS kind`,
       ).bind(runner, fg, bg).all()
       return runnerJson({ rows: results })
     }
@@ -559,6 +682,41 @@ export async function runnerApi(request: Request, env: Env): Promise<Response> {
       return runnerJson({ changed: meta?.changes ?? 0 })
     }
 
+    // What this runner's skills can do (§1 of docs/tools-and-approvals.md).
+    // The whole set, every time: the table is this runner's rows replaced,
+    // so a tool the owner deleted stops being listed. `argv` is not sent and
+    // is not wanted — only the runner knows what a tool actually runs.
+    case 'tools': {
+      if (!runner) return runnerJson({ error: 'tools needs a runner name' }, 400)
+      const tools = Array.isArray(body?.tools) ? body.tools : []
+      if (tools.length > 200) return runnerJson({ error: 'too many tools' }, 400)
+      const rows: { name: string; description: string; input: string; sha256: string }[] = []
+      for (const t of tools) {
+        const name = String(t?.name ?? '')
+        if (!TOOL_NAME.test(name) || BUILT_IN.includes(name)) {
+          return runnerJson({ error: `bad tool name: ${JSON.stringify(name)}` }, 400)
+        }
+        if (!/^[0-9a-f]{64}$/.test(String(t?.sha256 ?? ''))) {
+          return runnerJson({ error: `${name}: sha256 must be hex` }, 400)
+        }
+        rows.push({
+          name,
+          description: String(t?.description ?? '').slice(0, 4000),
+          input: JSON.stringify(t?.input ?? { type: 'object' }).slice(0, 8000),
+          sha256: String(t.sha256),
+        })
+      }
+      const stmts = [env.DB.prepare(`DELETE FROM tools WHERE runner = ?`).bind(runner)]
+      for (const r of rows) {
+        stmts.push(env.DB.prepare(
+          `INSERT INTO tools (runner, name, description, input, sha256, updated_at)
+           VALUES (?, ?, ?, ?, ?, datetime('now'))`,
+        ).bind(runner, r.name, r.description, r.input, r.sha256))
+      }
+      await env.DB.batch(stmts)
+      return runnerJson({ ok: true, tools: rows.length })
+    }
+
     // Backs `sasonica status`, so the owner can ask a machine what it has been
     // doing without a Cloudflare credential in the picture.
     case 'status': {
@@ -593,14 +751,17 @@ interface Caller {
   name: string | null
   agent: string
 }
-async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean, who: Caller): Promise<{ row: Row; timedOut: boolean }> {
+async function enqueue(env: Env, command: string, waitSeconds: number, background: boolean, who: Caller,
+                       kind: 'shell' | 'tool' = 'shell'): Promise<{ row: Row; timedOut: boolean }> {
   const nonce = randomHex(16)
+  // Signed exactly as a shell row is: the scheme does not know or care
+  // which kind of row it is, only what the runner will read back.
   const sig = await hmacHex(env.SASONICA_HMAC_KEY, `${nonce}\n${command}`)
   const ins = await env.DB.prepare(
-    `INSERT INTO commands (command, status, sig, nonce, background, client, name, agent, created_at, updated_at)
-     VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+    `INSERT INTO commands (command, status, sig, nonce, background, client, name, agent, kind, created_at, updated_at)
+     VALUES (?, 'pending', ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
   )
-    .bind(command, sig, nonce, background ? 1 : 0, who.client, who.name, who.agent)
+    .bind(command, sig, nonce, background ? 1 : 0, who.client, who.name, who.agent, kind)
     .run()
   const id = Number(ins.meta.last_row_id)
   const r = await awaitRow(env, id, waitSeconds)
@@ -646,8 +807,18 @@ export default {
       }
       case 'ping':
         return rpc(id, {})
-      case 'tools/list':
-        return rpc(id, { tools: TOOLS })
+      case 'tools/list': {
+        // The built-ins, then whatever the runners have published (§1 of
+        // docs/tools-and-approvals.md). A published tool is an ordinary MCP
+        // tool on the wire; its name is `<skill>__<tool>`, so it can never
+        // be mistaken for one of the four above.
+        let published: ToolRow[] = []
+        try { published = await publishedTools(env) } catch { published = [] }
+        const extra = published
+          .filter((t) => TOOL_NAME.test(t.name) && !BUILT_IN.includes(t.name))
+          .map((t) => ({ name: t.name, description: t.description, inputSchema: parseSchema(t.input) }))
+        return rpc(id, { tools: [...TOOLS, ...extra] })
+      }
       case 'tools/call': {
         const name = params?.name
         const args = params?.arguments ?? {}
@@ -707,6 +878,38 @@ export default {
           const r = await awaitRow(env, rid, wait)
           if (!r.row) return toolText(id, `No command #${rid}.`, true)
           return toolText(id, render(r.row, r.timedOut), FAILED.includes(r.row.status))
+        }
+        // A published tool: check the arguments against the schema the
+        // runner gave us, then queue a row naming the tool rather than a
+        // command. What runs is the runner's argv template; nothing here
+        // can widen it.
+        if (typeof name === 'string' && TOOL_NAME.test(name)) {
+          const tool = await env.DB.prepare(
+            `SELECT runner, name, description, input, sha256 FROM tools WHERE name = ?
+              ORDER BY updated_at DESC LIMIT 1`,
+          ).bind(name).first<ToolRow>()
+          if (!tool) return rpcError(id, -32601, `unknown tool ${JSON.stringify(name)}`)
+          if (!args || typeof args !== 'object' || Array.isArray(args)) {
+            return toolText(id, `${name}: arguments must be an object.`, true)
+          }
+          // `wait` means the same here as on the built-ins — how long to
+          // block for the result — unless the tool declares an argument of
+          // that name, in which case it is the tool's and is passed on.
+          const schema = parseSchema(tool.input)
+          const declaresWait = !!(schema?.properties && typeof schema.properties === 'object' && 'wait' in schema.properties)
+          const callArgs: Record<string, unknown> = { ...(args as Record<string, unknown>) }
+          if (!declaresWait) delete callArgs.wait
+          const bad = checkArgs(schema, callArgs)
+          if (bad) return toolText(id, `${name}: ${bad}.`, true)
+          const command = toolCommand(name, callArgs, tool.sha256)
+          if (command.length > MAX_COMMAND_CHARS) {
+            return toolText(id, `${name}: the arguments are ${command.length} characters; the limit is ${MAX_COMMAND_CHARS}.`, true)
+          }
+          const wait = clampWait(env, args.wait, Number(env.SASONICA_WAIT_DEFAULT ?? 30))
+          const agent = (await agentFromSessionId(env, scope, request.headers.get('mcp-session-id')))
+            ?? agentFromUserAgent(request) ?? 'unknown'
+          const r = await enqueue(env, command, wait, false, { client, name: target.name, agent }, 'tool')
+          return toolText(id, render(r.row, r.timedOut), !r.timedOut && FAILED.includes(r.row.status))
         }
         return rpcError(id, -32601, `unknown tool ${JSON.stringify(name)}`)
       }

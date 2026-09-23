@@ -26,12 +26,12 @@ export function fakeD1(rows = []) {
   // CREATE TABLE here, so nothing extra is needed.
   const insert = db.prepare(
     `INSERT INTO commands (command, status, sig, nonce, background, cancel, runner,
-       output, exit_code, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+       output, exit_code, kind, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
   for (const r of rows) {
     insert.run(r.command ?? 'true', r.status ?? 'pending', r.sig ?? 'sig', r.nonce ?? `n${Math.random()}`,
       r.background ?? 0, r.cancel ?? 0, r.runner ?? null, r.output ?? null,
-      r.exit_code ?? null, r.created_at ?? NOW, r.updated_at ?? NOW);
+      r.exit_code ?? null, r.kind ?? 'shell', r.created_at ?? NOW, r.updated_at ?? NOW);
   }
 
   const binding = {
@@ -58,6 +58,14 @@ export function fakeD1(rows = []) {
       };
       return stmt;
     },
+    // D1's batch: the statements in order, in one go. The Worker publishes
+    // a runner's tools this way (delete then insert), so the fake has to
+    // run them rather than pattern-match them.
+    async batch(stmts) {
+      const out = [];
+      for (const st of stmts) out.push(await st.run());
+      return out;
+    },
   };
   const handle = {
     db, binding,
@@ -67,12 +75,13 @@ export function fakeD1(rows = []) {
     add: (r) => {
       insert.run(r.command ?? 'true', r.status ?? 'pending', r.sig ?? 'sig',
         r.nonce ?? `n${Math.random()}`, r.background ?? 0, r.cancel ?? 0,
-        r.runner ?? null, r.output ?? null, r.exit_code ?? null, NOW, NOW);
+        r.runner ?? null, r.output ?? null, r.exit_code ?? null, r.kind ?? 'shell', NOW, NOW);
       return Number(db.prepare('SELECT max(id) AS id FROM commands').get().id);
     },
     // Flip a flag from outside, the way cancel and detach reach a running job.
     set: (id, column, value) =>
       db.prepare(`UPDATE commands SET ${column} = ? WHERE id = ?`).run(value, id),
+    tools: () => db.prepare('SELECT * FROM tools ORDER BY name').all(),
     // A per-client connector URL, stored as `sasonica client add` stores it:
     // the label and the sha256 of the secret, never the secret.
     addClient: (label, secret, { revoked = false } = {}) => db.prepare(

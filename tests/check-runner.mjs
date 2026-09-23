@@ -255,7 +255,141 @@ async function stopsGrowing(file, ms = 14000) {
 }
 
 // --- cases -------------------------------------------------------------------
+// --- typed tools ------------------------------------------------------------
+// Two tools whose argv is this very node printing the arguments it was
+// handed, so a case can see exactly what reached the process.
+const ECHO_ARGS = 'console.log(JSON.stringify(process.argv.slice(1)))';
+
+function writeTools(conf) {
+  const dir = path.join(conf, 'tools');
+  mkdirSync(dir, { recursive: true });
+  const tools = [
+    {
+      name: 'echo',
+      description: 'Print what it was given.',
+      input: { type: 'object', properties: { text: { type: 'string', maxLength: 40 } }, required: ['text'] },
+      argv: [process.execPath, '-e', ECHO_ARGS, '{text}'],
+    },
+    {
+      name: 'optional',
+      description: 'One argument that may be left out.',
+      input: { type: 'object', properties: { extra: { type: 'string' } } },
+      argv: [process.execPath, '-e', ECHO_ARGS, 'always', '{extra}'],
+    },
+  ];
+  writeFileSync(path.join(dir, 'test.json'), JSON.stringify({ skill: 'test', tools }));
+  // The sha the runner will compute, so a case can queue a row against it.
+  const shas = {};
+  for (const t of tools) {
+    const entry = {
+      argv: t.argv, description: t.description, input: t.input,
+      name: `test__${t.name}`, timeout_s: 0,
+    };
+    shas[`test__${t.name}`] = createHash('sha256').update(canonicalJson(entry), 'utf8').digest('hex');
+  }
+  return shas;
+}
+
+/** The runner's canonical JSON: keys sorted at every level. */
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
+  }
+  return JSON.stringify(value === undefined ? null : value);
+}
+
+/** A tool row's command, as the Worker writes it. */
+const toolCall = (tool, args, manifestSha) => {
+  const ordered = {};
+  for (const k of Object.keys(args).sort()) ordered[k] = args[k];
+  return JSON.stringify({ args: ordered, manifest_sha: manifestSha, tool });
+};
+
 const cases = {
+  // --- typed tools (docs/tools-and-approvals.md §1) --------------------------
+  //
+  // A tool row names a tool and its arguments; what runs is THIS machine's
+  // argv template, through execFile, with no shell anywhere. The row cannot
+  // widen it, and a manifest edited since the call was made is refused.
+
+  async toolsArePublishedAtStartup() {
+    const { conf } = setup();
+    writeTools(conf);
+    const db = await start([]);
+    const rows = db.tools();
+    assert.deepEqual(rows.map((r) => r.name), ['test__echo', 'test__optional']);
+    assert.equal(rows[0].runner, 'testrunner');
+    // The argv template never leaves this machine — that is the point.
+    assert.ok(!JSON.stringify(rows).includes('argv'), 'an argv reached the Worker');
+    assert.ok(logged(/tools: published 2/), logs.join('\n'));
+  },
+
+  async aToolRunsItsArgv() {
+    const { conf } = setup();
+    const sha = writeTools(conf).test__echo;
+    const db = await start([job(toolCall('test__echo', { text: 'hello there' }, sha), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'done');
+    assert.equal(db.row(1).exit_code, 0);
+    assert.deepEqual(JSON.parse(norm(db.row(1).output)), ['hello there']);
+  },
+
+  // The argument is one argv element, whatever is in it: no shell reads it,
+  // so there is nothing for a semicolon to mean.
+  async anArgumentCannotWidenTheCommand() {
+    const { conf } = setup();
+    const sha = writeTools(conf).test__echo;
+    const nasty = `; touch ${path.basename(MARKER)}; rm -rf ~`;
+    const db = await start([job(toolCall('test__echo', { text: nasty }, sha), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'done', db.row(1).output);
+    assert.deepEqual(JSON.parse(norm(db.row(1).output)), [nasty]);
+    assert.ok(!existsSync(path.join(process.cwd(), path.basename(MARKER))), 'the argument reached a shell');
+  },
+
+  // An optional argument that was not given drops out of the argv instead of
+  // arriving as an empty string.
+  async anOptionalArgumentDropsOut() {
+    const { conf } = setup();
+    const sha = writeTools(conf).test__optional;
+    const db = await start([job(toolCall('test__optional', {}, sha), { kind: 'tool' })]);
+    assert.deepEqual(JSON.parse(norm(db.row(1).output)), ['always']);
+  },
+
+  async aChangedManifestRefusesAnOldCall() {
+    const { conf } = setup();
+    writeTools(conf);
+    const db = await start([job(toolCall('test__echo', { text: 'hi' }, 'f'.repeat(64)), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'rejected');
+    assert.match(db.row(1).output, /the manifest changed/);
+  },
+
+  async anUnknownToolIsRefused() {
+    const { conf } = setup();
+    writeTools(conf);
+    const db = await start([job(toolCall('nothing__here', {}, 'a'.repeat(64)), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'rejected');
+    assert.match(db.row(1).output, /no tool named "nothing__here"/);
+  },
+
+  // The Worker checks the arguments too, but the runner's check is the one
+  // that counts: this row was queued straight into the table.
+  async theRunnerChecksTheArgumentsItself() {
+    const { conf } = setup();
+    const sha = writeTools(conf).test__echo;
+    const db = await start([job(toolCall('test__echo', { text: 'x'.repeat(50) }, sha), { kind: 'tool' })]);
+    assert.equal(db.row(1).status, 'rejected');
+    assert.match(db.row(1).output, /text is 50 characters; the limit is 40/);
+  },
+
+  async aBadSignatureIsStillRefusedOnAToolRow() {
+    const { conf } = setup();
+    const sha = writeTools(conf).test__echo;
+    const command = toolCall('test__echo', { text: 'hi' }, sha);
+    const db = await start([job(command, { kind: 'tool', sig: 'de'.repeat(32) })]);
+    assert.equal(db.row(1).status, 'rejected');
+    assert.match(db.row(1).output, /signature did not verify/);
+  },
+
   // THE regression test: the runner passed a not-yet-open createWriteStream to
   // spawn, which throws ERR_INVALID_ARG_VALUE, so every job wedged in 'running'.
   async basic() {
